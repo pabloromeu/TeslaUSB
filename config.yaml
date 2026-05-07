@@ -116,7 +116,7 @@ mapping:
 cloud_archive:
   enabled: true
   # Cloud provider (configured via web UI — credentials stored encrypted, NOT here)
-  provider: ""                           # google_drive | onedrive | dropbox | s3 | b2 | wasabi
+  provider: "google_drive"               # google_drive | onedrive | dropbox | s3 | b2 | wasabi
   remote_path: "TeslaUSB"               # Path/folder on cloud storage
   # Sync behavior
   sync_folders:                          # Which TeslaCam subfolders to sync
@@ -130,7 +130,7 @@ cloud_archive:
   max_upload_mbps: 5                     # Bandwidth limit (Pi has limited upload)
   cloud_reserve_gb: 1                    # Keep this much free on cloud (don't fill to 100%)
   keep_local_after_upload: true          # Keep local files after uploading to cloud
-  sync_non_event_videos: false          # Opt-in: sync videos without events or geolocation
+  sync_non_event_videos: true           # Opt-in: sync videos without events or geolocation
   cloud_auto_cleanup: false              # Auto-delete old cloud videos when storage is low
   cloud_cleanup_threshold_pct: 90        # Delete when cloud usage exceeds this %
   cloud_min_retention_days: 30           # Keep at least this many days of videos
