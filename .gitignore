@@ -25,3 +25,6 @@ __pycache__/
 
 # Generated protobuf (compiled on-device by setup_usb.sh)
 scripts/web/services/dashcam_pb2.py
+
+# Local device-specific backups (not for version control)
+.local/

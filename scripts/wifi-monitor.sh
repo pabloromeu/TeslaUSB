@@ -503,7 +503,6 @@ while true; do
             else
                 # Last resort: try explicit nmcli reconnect to configured connection
                 log "Standard recovery failed; trying explicit nmcli reconnect"
-                local active_conn
                 active_conn=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ':.*wireless' | head -1 | cut -d: -f1)
                 if [ -n "$active_conn" ]; then
                     nmcli connection up "$active_conn" 2>/dev/null && sleep 5
