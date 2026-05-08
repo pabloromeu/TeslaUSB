@@ -98,9 +98,16 @@ echo ""
 # 2. Secrets (rclone, WiFi)
 # ---------------------------------------------------------------------------
 echo "[2/6] Secrets"
-scp_file "/home/pablo/.config/rclone/rclone.conf" \
-         "$BACKUP_DIR/secrets/rclone.conf" \
-         "rclone.conf (Google Drive token)"
+
+# machine-id — CRITICAL: cloud_provider.enc is encrypted with Pi serial + machine-id.
+# Without this, cloud credentials cannot be decrypted after a fresh OS install.
+$SSH "$PI_HOST" "cat /etc/machine-id" > "$BACKUP_DIR/secrets/machine-id" 2>/dev/null \
+  && ok "machine-id (required to decrypt cloud_provider.enc)" \
+  || fail "machine-id"
+
+# rclone.conf is written to tmpfs (RAM) on-the-fly — not a persistent file.
+# The actual cloud token lives in cloud_provider.enc (backed up in step 3).
+skip "rclone.conf (not needed — token is in cloud_provider.enc)"
 
 # WiFi profiles (need sudo)
 $SSH "$PI_HOST" "sudo ls /etc/NetworkManager/system-connections/" 2>/dev/null \
@@ -191,11 +198,10 @@ echo "  $(find "$BACKUP_DIR/secrets"             -type f 2>/dev/null | wc -l | t
 echo "  $(find "$BACKUP_DIR/database"            -type f 2>/dev/null | wc -l | tr -d ' ') database files"
 echo ""
 
-RCLONE_STATUS="$BACKUP_DIR/secrets/rclone.conf"
-if [[ -s "$RCLONE_STATUS" ]]; then
-  ok "Google Drive token backed up"
+if [[ -s "$BACKUP_DIR/runtime/cloud_provider.enc" ]]; then
+  ok "Google Drive token backed up (cloud_provider.enc + tesla_salt.bin + machine-id)"
 else
-  skip "Google Drive token not backed up (run rclone config on Pi first)"
+  skip "Google Drive token not backed up (authenticate via web UI first)"
 fi
 
 echo ""

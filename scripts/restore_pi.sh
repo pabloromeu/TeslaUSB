@@ -124,15 +124,27 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "[2/6] Secrets"
 
-# rclone
-if [[ -s "$BACKUP_DIR/secrets/rclone.conf" ]]; then
-  $SSH "$PI_HOST" "mkdir -p /home/pablo/.config/rclone"
-  push_file "$BACKUP_DIR/secrets/rclone.conf" \
-            "/home/pablo/.config/rclone/rclone.conf" \
-            "rclone.conf (Google Drive token)"
+# machine-id — MUST be restored before cloud_provider.enc in step 3.
+# cloud_provider.enc is encrypted with: Pi serial + machine-id + tesla_salt.bin.
+# Restoring the original machine-id ensures the token can be decrypted.
+if [[ -s "$BACKUP_DIR/secrets/machine-id" ]]; then
+  CURRENT_ID=$($SSH "$PI_HOST" "cat /etc/machine-id" 2>/dev/null || echo "")
+  BACKUP_ID=$(cat "$BACKUP_DIR/secrets/machine-id")
+  if [[ "$CURRENT_ID" == "$BACKUP_ID" ]]; then
+    ok "machine-id already matches backup — no change needed"
+  else
+    push_file_sudo "$BACKUP_DIR/secrets/machine-id" "/etc/machine-id" \
+                   "machine-id (restoring original so cloud token decrypts)" \
+                   "root:root" "444"
+    echo ""
+    echo -e "  ${YELLOW}NOTE: machine-id was restored. A reboot is recommended before using cloud sync.${NC}"
+  fi
 else
-  skip "rclone.conf (not in backup — re-authenticate with: rclone config)"
+  skip "machine-id (not in backup — cloud credentials may not decrypt)"
 fi
+
+# rclone.conf is written to tmpfs on-the-fly from cloud_provider.enc — not needed here.
+skip "rclone.conf (token stored in cloud_provider.enc, not rclone.conf)"
 
 # WiFi profiles
 if [[ -d "$BACKUP_DIR/secrets/wifi" ]] && [[ -n "$(ls -A "$BACKUP_DIR/secrets/wifi" 2>/dev/null)" ]]; then
