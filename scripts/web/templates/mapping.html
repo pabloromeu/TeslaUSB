@@ -795,13 +795,24 @@
 
     <!-- Speed Color Legend (toggleable, hidden by default) -->
     <div class="speed-legend" id="speedLegend" aria-hidden="true">
-        <div class="speed-legend-title">Speed (mph)</div>
+        <div class="speed-legend-title">Speed ({{ 'km/h' if use_metric else 'mph' }})</div>
+        {% if use_metric %}
+        {# Colour thresholds are at 15/30/45/60/75 m/s = 54/108/162/216/270 km/h.
+           Labels show round numbers (≈) for readability. #}
+        <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#440154"></span><span>0&ndash;&#x223C;50</span></div>
+        <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#3b528b"></span><span>&#x223C;50&ndash;&#x223C;100</span></div>
+        <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#21918c"></span><span>&#x223C;100&ndash;&#x223C;150</span></div>
+        <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#5ec962"></span><span>&#x223C;150&ndash;&#x223C;200</span></div>
+        <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#fde725"></span><span>&#x223C;200&ndash;&#x223C;250</span></div>
+        <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#fffacd"></span><span>&#x223C;250+</span></div>
+        {% else %}
         <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#440154"></span><span>0&ndash;33</span></div>
         <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#3b528b"></span><span>33&ndash;67</span></div>
         <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#21918c"></span><span>67&ndash;100</span></div>
         <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#5ec962"></span><span>100&ndash;134</span></div>
         <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#fde725"></span><span>134&ndash;168</span></div>
         <div class="speed-legend-row"><span class="speed-legend-swatch" style="background:#fffacd"></span><span>168+</span></div>
+        {% endif %}
     </div>
 
     <!-- FAB Group (right-side floating) -->
@@ -852,6 +863,12 @@
 <script src="{{ url_for('static', filename='vendor/leaflet/leaflet.js') }}"></script>
 <script src="{{ url_for('static', filename='vendor/leaflet/leaflet.markercluster.js') }}"></script>
 <script>
+// Unit constants (set by server based on config.yaml web.units)
+const USE_METRIC   = {{ 'true' if use_metric else 'false' }};
+const SPEED_FACTOR = USE_METRIC ? 3.6 : 2.23694;
+const DIST_FACTOR  = USE_METRIC ? 1.0 : 0.621371;
+const DIST_UNIT    = USE_METRIC ? 'km' : 'mi';
+
 // Register Service Worker for offline tile caching (gap 1)
 if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/tile-cache-sw.js', { scope: '/' })
@@ -1253,7 +1270,7 @@ function buildDisambigRow(candidate, isAllTime, onPick) {
 
     const secondaryParts = [];
     const distMi = (typeof trip.distance_km === 'number')
-        ? (trip.distance_km * 0.621371).toFixed(1) + ' mi'
+        ? (trip.distance_km * DIST_FACTOR).toFixed(1) + ' ' + DIST_UNIT
         : null;
     const durMin = (typeof trip.duration_seconds === 'number')
         ? Math.round(trip.duration_seconds / 60) + ' min'
@@ -2324,7 +2341,7 @@ function openVideoOverlay(waypoint, clickPoint, routeWps) {
                 <div class="oh-gear" id="olGear">P</div>
                 <div class="oh-pedal oh-brake" id="olBrake"><span class="oh-fill"><i></i></span><span class="oh-lbl">B</span></div>
                 <span class="oh-blinker left" id="olBlinkerL">◀</span>
-                <div class="oh-speed"><span class="oh-speed-val" id="olSpeedVal">0</span><span class="oh-speed-unit">mph</span></div>
+                <div class="oh-speed"><span class="oh-speed-val" id="olSpeedVal">0</span><span class="oh-speed-unit">{{ 'km/h' if use_metric else 'mph' }}</span></div>
                 <span class="oh-blinker right" id="olBlinkerR">▶</span>
                 <div class="oh-wheel" id="olWheel"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8" stroke="#fff" stroke-width="1.4"/><path d="M6.8 9.8H17.2" stroke="#fff" stroke-width="2" stroke-linecap="round"/><path d="M12 9.8V16.8" stroke="#fff" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.8" stroke="#fff" stroke-width="1.4"/></svg></div>
                 <div class="oh-pedal oh-throttle" id="olThrottle"><span class="oh-fill"><i></i></span><span class="oh-lbl">A</span></div>
@@ -2505,7 +2522,7 @@ function updateOverlayTelemetry(wp) {
 
     // Speed
     const speedVal = document.getElementById('olSpeedVal');
-    if (speedVal) speedVal.textContent = Math.round(Math.abs((wp.speed_mps || 0) * 2.237));
+    if (speedVal) speedVal.textContent = Math.round(Math.abs((wp.speed_mps || 0) * SPEED_FACTOR));
 
     // Gear
     const gear = document.getElementById('olGear');

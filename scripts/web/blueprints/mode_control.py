@@ -612,13 +612,15 @@ def _get_mapping_config() -> dict:
     """Read current mapping settings for the settings page."""
     from config import (
         MAPPING_ENABLED, MAPPING_ARCHIVE_INDEXING,
-        MAPPING_TRIP_GAP_MINUTES, MAPPING_EVENT_THRESHOLDS,
+        MAPPING_TRIP_GAP_MINUTES, MAPPING_EVENT_THRESHOLDS, USE_METRIC,
     )
+    speed_mps = MAPPING_EVENT_THRESHOLDS.get('speed_limit_mps', 35.76)
+    speed_display = round(speed_mps * 3.6, 0) if USE_METRIC else round(speed_mps * 2.237, 0)
     return {
         'enabled': MAPPING_ENABLED,
         'archive_indexing': MAPPING_ARCHIVE_INDEXING,
         'trip_gap_minutes': MAPPING_TRIP_GAP_MINUTES,
-        'speed_limit_mph': round(MAPPING_EVENT_THRESHOLDS.get('speed_limit_mps', 35.76) * 2.237, 0),
+        'speed_limit_display': speed_display,
     }
 
 
@@ -633,6 +635,22 @@ def _get_network_config() -> dict:
 # ---------------------------------------------------------------------------
 # Settings Update Routes
 # ---------------------------------------------------------------------------
+
+@mode_control_bp.route("/save/units", methods=["POST"])
+def save_units():
+    """Save display units (imperial/metric) to config.yaml."""
+    from helpers.config_updater import update_config_yaml
+
+    units = request.form.get('units', 'imperial')
+    if units not in ('imperial', 'metric'):
+        units = 'imperial'
+    try:
+        update_config_yaml({'web.units': units})
+        flash("Display units updated.", "success")
+    except Exception as e:
+        flash(f"Failed to save: {e}", "danger")
+    return redirect(url_for('mode_control.index'))
+
 
 @mode_control_bp.route("/save/archive", methods=["POST"])
 def save_archive_settings():
@@ -662,8 +680,9 @@ def save_mapping_settings():
     from helpers.config_updater import update_config_yaml
 
     try:
-        speed_mph = float(request.form.get('speed_limit_mph', 80))
-        speed_mps = round(speed_mph / 2.237, 2)
+        from config import USE_METRIC
+        speed_input = float(request.form.get('speed_limit_display', 80))
+        speed_mps = round(speed_input / 3.6, 2) if USE_METRIC else round(speed_input / 2.237, 2)
 
         updates = {
             'mapping.enabled': 'enabled' in request.form,

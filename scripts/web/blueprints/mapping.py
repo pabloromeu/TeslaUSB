@@ -4,6 +4,9 @@ import os
 import re
 from flask import Blueprint, render_template, jsonify, request, redirect, url_for, flash
 
+import json
+
+import config as _config
 from config import (
     IMG_CAM_PATH, MAPPING_ENABLED, MAPPING_DB_PATH,
     MAPPING_SAMPLE_RATE, MAPPING_TRIP_GAP_MINUTES, MAPPING_EVENT_THRESHOLDS,
@@ -23,6 +26,33 @@ mapping_bp = Blueprint('mapping', __name__, url_prefix='')
 # style attempt against /api/day/<date>/routes from ever reaching
 # the database layer.
 _DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _localise_event_descriptions(events: list) -> list:
+    """Rewrite speed-based descriptions using the live unit setting.
+
+    The ``description`` stored in the DB was generated at indexing time
+    with whatever unit format was current then. This function re-derives
+    the display string from the raw ``speed_mps`` value in ``metadata``
+    so the popup always reflects the user's current Imperial/Metric
+    preference without requiring a re-index.
+    """
+    use_metric = _config.USE_METRIC
+    for ev in events:
+        if ev.get('event_type') != 'speeding':
+            continue
+        try:
+            meta = json.loads(ev.get('metadata') or '{}')
+            speed_mps = meta.get('speed_mps')
+            if speed_mps is None:
+                continue
+            if use_metric:
+                ev['description'] = f'Speed: {speed_mps * 3.6:.0f} km/h'
+            else:
+                ev['description'] = f'Speed: {speed_mps * 2.237:.0f} mph'
+        except (ValueError, TypeError, KeyError):
+            pass
+    return events
 
 
 @mapping_bp.before_request
@@ -235,7 +265,7 @@ def api_events():
                               event_type=event_type, severity=severity,
                               bbox=bbox, date_from=date_from, date_to=date_to,
                               date=date)
-        return jsonify({'events': events})
+        return jsonify({'events': _localise_event_descriptions(events)})
     except Exception as e:
         logger.error("Failed to query events: %s", e)
         return jsonify({'error': str(e)}), 500
@@ -692,6 +722,7 @@ def api_sentry_events():
         # Fetch ALL detected events — sentry, saved, and driving events
         # (hard_acceleration, sharp_turn, fsd_disengage, harsh_brake, etc.)
         events = query_events(MAPPING_DB_PATH, limit=200)
+        events = _localise_event_descriptions(events)
         # Sort by timestamp descending (most recent first)
         events.sort(key=lambda e: e.get('timestamp', ''), reverse=True)
 

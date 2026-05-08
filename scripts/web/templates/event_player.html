@@ -740,7 +740,7 @@
                     <!-- Speed -->
                     <div class="hud-speed">
                         <div class="hud-speed-value" id="hudSpeed">0</div>
-                        <div class="hud-speed-label">mph</div>
+                        <div class="hud-speed-label">{{ 'km/h' if use_metric else 'mph' }}</div>
                     </div>
 
                     <!-- Right turn signal -->
@@ -954,6 +954,10 @@
 <script src="{{ url_for('static', filename='js/protobuf.min.js') }}"></script>
 <script src="{{ url_for('static', filename='js/dashcam-mp4.js') }}"></script>
 <script>
+    // Unit constants (set by server based on config.yaml web.units)
+    const USE_METRIC   = {{ 'true' if use_metric else 'false' }};
+    const SPEED_FACTOR = USE_METRIC ? 3.6 : 2.23694;
+
     const folder = "{{ folder }}";
     const eventName = "{{ event.name }}";
     const folderStructure = "{{ folder_structure }}";
@@ -1552,10 +1556,10 @@
 
         const sei = frame.sei;
 
-        // Speed (convert m/s to mph, always show positive value)
+        // Speed (convert m/s to display unit, always show positive value)
         if (sei.vehicleSpeedMps !== undefined) {
-            const mph = Math.round(Math.abs(sei.vehicleSpeedMps) * 2.23694);
-            document.getElementById('hudSpeed').textContent = mph;
+            const speedDisplay = Math.round(Math.abs(sei.vehicleSpeedMps) * SPEED_FACTOR);
+            document.getElementById('hudSpeed').textContent = speedDisplay;
         } else {
             document.getElementById('hudSpeed').textContent = '0';
         }

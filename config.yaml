@@ -90,6 +90,7 @@ web:
   lightshow_folder: LightShow # Folder on part2 where light shows are stored
   max_upload_size_mb: 2048 # Max accepted upload size for music/lightshow (MiB)
   max_upload_chunk_mb: 16 # Chunk size for streaming uploads (MiB)
+  units: "imperial"        # Display units: "imperial" (mph, mi) or "metric" (km/h, km)
 
 # ============================================================================
 # Mapping & Geo-Indexing Configuration

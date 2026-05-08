@@ -946,7 +946,7 @@ def _detect_events(
                 'lat': wp['lat'], 'lon': wp['lon'],
                 'event_type': 'speeding',
                 'severity': 'info',
-                'description': f'Speed: {speed * 2.237:.0f} mph',
+                'description': f'Speed: {speed * 3.6:.0f} km/h ({speed * 2.237:.0f} mph)',  # rewritten at API layer per unit setting
                 'video_path': video_path,
                 'frame_offset': wp.get('frame_offset', 0),
                 'metadata': json.dumps({'speed_mps': speed, 'limit_mps': limit}),
@@ -3960,6 +3960,8 @@ def get_driving_stats(db_path: str) -> dict:
             'total_duration_hours': round(total_duration / 3600, 1),
             'avg_speed_mph': round(avg_speed * 2.23694, 1),
             'max_speed_mph': round(max_speed * 2.23694, 1),
+            'avg_speed_kph': round(avg_speed * 3.6, 1),
+            'max_speed_kph': round(max_speed * 3.6, 1),
             'fsd_usage_pct': fsd_pct,
             'total_events': event_count,
             'warning_events': warning_count,

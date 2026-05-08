@@ -77,6 +77,7 @@ SPEED_STEP = config['web']['speed_step']
 LIGHT_SHOW_FOLDER = config['web']['lightshow_folder']
 MAX_UPLOAD_SIZE_MB = int(config['web'].get('max_upload_size_mb', 2048))
 MAX_UPLOAD_CHUNK_MB = int(config['web'].get('max_upload_chunk_mb', 16))
+USE_METRIC = config['web'].get('units', 'imperial').lower() == 'metric'
 
 # Mapping & Geo-Indexing Configuration
 _mapping = config.get('mapping', {})

@@ -253,6 +253,15 @@
     <details class="settings-section">
         <summary>Mapping & Indexing</summary>
         <div class="section-content">
+            <form method="post" action="{{ url_for('mode_control.save_units') }}" style="margin-bottom:16px">
+                <div class="form-group">
+                    <label style="font-size:0.85rem"><strong>Display units</strong></label>
+                    <select name="units" onchange="this.form.submit()" style="width:100%; padding:6px 10px; border:1px solid var(--border); border-radius:var(--radius-md); background:var(--bg-tertiary); color:var(--text-primary); min-height:44px; cursor:pointer">
+                        <option value="imperial" {{ 'selected' if not use_metric }}>Imperial (mph, mi)</option>
+                        <option value="metric"   {{ 'selected' if use_metric }}>Metric (km/h, km)</option>
+                    </select>
+                </div>
+            </form>
             <form method="post" action="{{ url_for('mode_control.save_mapping_settings') }}">
                 <p style="font-size:0.85rem; color:var(--text-secondary); margin:0 0 16px">
                     Tesla embeds GPS coordinates and telemetry data (speed, braking, steering) inside each dashcam video.
@@ -292,8 +301,8 @@
                         </p>
                     </div>
                     <div class="form-group">
-                        <label style="font-size:0.85rem"><strong>Speed alert (mph)</strong></label>
-                        <input type="number" name="speed_limit_mph" value="{{ cfg_mapping.speed_limit_mph|int }}" min="0" max="200" step="5" style="width:100%; padding:6px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg-secondary)">
+                        <label style="font-size:0.85rem"><strong>Speed alert ({{ 'km/h' if use_metric else 'mph' }})</strong></label>
+                        <input type="number" name="speed_limit_display" value="{{ cfg_mapping.speed_limit_display|int }}" min="0" max="300" step="5" style="width:100%; padding:6px 10px; border:1px solid var(--border); border-radius:var(--radius-md); background:var(--bg-tertiary); color:var(--text-primary); min-height:44px">
                         <p style="font-size:0.8rem; color:var(--text-secondary); margin:4px 0 0">
                             Marks a driving event on the map when your speed exceeds this threshold.
                             Set to 0 to disable speed alerts entirely.
