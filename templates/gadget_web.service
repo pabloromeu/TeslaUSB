@@ -13,6 +13,8 @@ Type=simple
 User=root
 Group=__TARGET_USER__
 WorkingDirectory=__GADGET_DIR__/scripts/web
+# Ensure /run/samba exists before namespace setup (smbd is now disabled at boot per #74)
+ExecStartPre=/bin/mkdir -p /run/samba
 ExecStart=/usr/bin/python3 __GADGET_DIR__/scripts/web/web_control.py
 Restart=on-failure
 RestartSec=30
