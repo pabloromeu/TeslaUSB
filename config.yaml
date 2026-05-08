@@ -32,7 +32,7 @@ disk_images:
 # These values are specific to the setup process and can be configured here
 # or left empty ("") for interactive prompts during setup.
 setup:
-  part1_size: "64G" # TeslaCam drive size (e.g., "50G" or leave empty for interactive)
+  part1_size: "160G" # TeslaCam drive size (e.g., "50G" or leave empty for interactive)
   part2_size: "8G" # LightShow drive size (e.g., "10G" or leave empty for interactive)
   part3_size: "512M" # Music drive size (e.g., "32G" or leave empty to skip/interactive)
   reserve_size: "5G" # Headroom to leave free on Pi filesystem (default: 5G)
