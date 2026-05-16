@@ -82,11 +82,10 @@ USE_METRIC = config['web'].get('units', 'imperial').lower() == 'metric'
 # Mapping & Geo-Indexing Configuration
 _mapping = config.get('mapping', {})
 MAPPING_ENABLED = bool(_mapping.get('enabled', False))
-MAPPING_INDEX_ON_STARTUP = bool(_mapping.get('index_on_startup', True))
-MAPPING_INDEX_ON_MODE_SWITCH = bool(_mapping.get('index_on_mode_switch', True))
 MAPPING_SAMPLE_RATE = int(_mapping.get('sample_rate', 30))
 MAPPING_TRIP_GAP_MINUTES = int(_mapping.get('trip_gap_minutes', 5))
-MAPPING_ARCHIVE_INDEXING = bool(_mapping.get('archive_indexing', True))
+# Phase 5.9 (issue #102) — too-new gate exposed via Settings → Advanced.
+MAPPING_INDEX_TOO_NEW_SECONDS = float(_mapping.get('index_too_new_seconds', 120))
 MAPPING_DB_PATH = os.path.join(GADGET_DIR, 'geodata.db')
 _event_cfg = _mapping.get('event_detection', {})
 MAPPING_EVENT_THRESHOLDS = {
@@ -95,7 +94,6 @@ MAPPING_EVENT_THRESHOLDS = {
     'hard_accel_threshold': float(_event_cfg.get('hard_accel_threshold', 3.5)),
     'sharp_turn_lateral_g': float(_event_cfg.get('sharp_turn_lateral_g', 4.0)),
     'speed_limit_mps': float(_event_cfg.get('speed_limit_mps', 35.76)),
-    'fsd_disengage_detect': bool(_event_cfg.get('fsd_disengage_detect', True)),
 }
 
 # Cloud Archive Configuration
@@ -104,8 +102,46 @@ CLOUD_ARCHIVE_ENABLED = bool(_cloud.get('enabled', False))
 CLOUD_ARCHIVE_SYNC_ENABLED = bool(_cloud.get('sync_enabled', True))  # auto-sync on/off (separate from page access)
 CLOUD_ARCHIVE_PROVIDER = _cloud.get('provider', '')
 CLOUD_ARCHIVE_REMOTE_PATH = _cloud.get('remote_path', 'TeslaUSB')
-CLOUD_ARCHIVE_SYNC_FOLDERS = _cloud.get('sync_folders', ['SentryClips', 'SavedClips'])
-CLOUD_ARCHIVE_PRIORITY_ORDER = _cloud.get('priority_order', ['SentryClips', 'SavedClips'])
+
+
+def _normalize_cloud_folder_list(values, default):
+    """Filter a cloud_archive folder list to the supported set.
+
+    * Drops non-string entries.
+    * Rewrites legacy ``RecentClips`` → ``ArchivedClips`` so installs
+      that ever had RecentClips checked silently switch to the
+      SD-card-resident ArchivedClips (RecentClips rotates hourly and
+      was never a useful sync target; the previous default produced
+      misleading UI without doing real work).
+    * Keeps only ``SentryClips`` / ``SavedClips`` / ``ArchivedClips``.
+    * Deduplicates while preserving order.
+    * Falls back to *default* if the normalised result is empty (so a
+      typo in config.yaml cannot silently disable all sync).
+    """
+    valid = ("SentryClips", "SavedClips", "ArchivedClips")
+    if not isinstance(values, (list, tuple)):
+        return list(default)
+    seen = []
+    for v in values:
+        if not isinstance(v, str):
+            continue
+        folder = v.strip()
+        if folder == "RecentClips":
+            folder = "ArchivedClips"
+        if folder in valid and folder not in seen:
+            seen.append(folder)
+    return seen if seen else list(default)
+
+
+_CLOUD_DEFAULT_FOLDERS = ['SentryClips', 'SavedClips', 'ArchivedClips']
+CLOUD_ARCHIVE_SYNC_FOLDERS = _normalize_cloud_folder_list(
+    _cloud.get('sync_folders', _CLOUD_DEFAULT_FOLDERS),
+    _CLOUD_DEFAULT_FOLDERS,
+)
+CLOUD_ARCHIVE_PRIORITY_ORDER = _normalize_cloud_folder_list(
+    _cloud.get('priority_order', _CLOUD_DEFAULT_FOLDERS),
+    CLOUD_ARCHIVE_SYNC_FOLDERS,
+)
 CLOUD_ARCHIVE_MAX_UPLOAD_MBPS = int(_cloud.get('max_upload_mbps', 5))
 CLOUD_ARCHIVE_RESERVE_GB = float(_cloud.get('cloud_reserve_gb', 1))
 CLOUD_ARCHIVE_SYNC_NON_EVENT = bool(_cloud.get('sync_non_event_videos', False))
@@ -115,29 +151,203 @@ CLOUD_MIN_RETENTION_DAYS = int(_cloud.get('cloud_min_retention_days', 30))
 CLOUD_ARCHIVE_DB_PATH = os.path.join(GADGET_DIR, 'cloud_sync.db')
 CLOUD_PROVIDER_CREDS_PATH = os.path.join(GADGET_DIR, 'cloud_provider.enc')
 
-# Live Event Sync Configuration
-# Separate first-class subsystem from cloud_archive — own queue, worker, and config.
-# Shares CLOUD_ARCHIVE_PROVIDER + CLOUD_PROVIDER_CREDS_PATH for credentials only.
-_les = config.get('live_event_sync', {})
-LIVE_EVENT_SYNC_ENABLED = bool(_les.get('enabled', False))
-LIVE_EVENT_WATCH_FOLDERS = list(_les.get('watch_folders', ['SentryClips', 'SavedClips']))
-LIVE_EVENT_UPLOAD_SCOPE = str(_les.get('upload_scope', 'event_minute'))
-LIVE_EVENT_RETRY_MAX_ATTEMPTS = int(_les.get('retry_max_attempts', 5))
-LIVE_EVENT_RETRY_BACKOFF_SECONDS = list(_les.get('retry_backoff_seconds', [30, 120, 300, 900, 3600]))
-LIVE_EVENT_DAILY_DATA_CAP_MB = int(_les.get('daily_data_cap_mb', 0))
-LIVE_EVENT_NOTIFY_WEBHOOK_URL = str(_les.get('notify_webhook_url', '') or '')
+# Phase 2c (issue #76) — local SD-card storage management for ArchivedClips.
+# These are scoped under ``cloud_archive`` in config.yaml per the issue spec.
+# The retention value falls back to the legacy ``archive.retention_days`` so
+# existing installs that already tuned ``archive.retention_days`` keep their
+# preferred value without editing the new key. The disk-space thresholds are
+# new and have no legacy equivalent.
+CLOUD_ARCHIVE_RETENTION_DAYS = int(_cloud.get(
+    'archived_clips_retention_days',
+    int(config.get('archive', {}).get('retention_days', 30)),
+))
+CLOUD_ARCHIVE_DISK_SPACE_WARNING_MB = int(_cloud.get(
+    'disk_space_warning_mb', 500,
+))
+CLOUD_ARCHIVE_DISK_SPACE_CRITICAL_MB = int(_cloud.get(
+    'disk_space_critical_mb', 100,
+))
+CLOUD_ARCHIVE_DISK_SPACE_PAUSE_SECONDS = float(_cloud.get(
+    'disk_space_pause_seconds', 300,
+))
+
+# Wave 4 PR-F2 (issue #184): unified ``pipeline_queue`` integration.
+# Wave 4 (issue #184): unified ``pipeline_queue`` integration.
+# Three flags control the cutover. PR-F4 flipped the producer +
+# reader defaults to True; ``shadow_pipeline_queue`` flipped to False
+# (it was a cutover-window observability shim and is a tautology now
+# that the reader IS the pipeline_queue). See ``cloud_archive`` block
+# in ``config.yaml`` for the full design notes.
+#
+# ``CLOUD_ARCHIVE_ENQUEUE_TO_PIPELINE`` — PRODUCER hook. When True,
+# every event discovered by ``_discover_events`` is also enqueued
+# into ``pipeline_queue`` with ``stage='cloud_pending'`` (idempotent
+# via the existing UNIQUE index). Default True (was False until
+# PR-F4) — operators who need to roll back to the legacy disk-walk
+# can flip this off.
+CLOUD_ARCHIVE_ENQUEUE_TO_PIPELINE = bool(
+    _cloud.get('enqueue_to_pipeline', True)
+)
+# ``CLOUD_ARCHIVE_SHADOW_PIPELINE_QUEUE`` — OBSERVABILITY shim used
+# during the cutover. Compares the legacy reader's first pick against
+# the ``pipeline_queue`` top-N and logs a WARNING on disagreement.
+# Default False (was True until PR-F4) — the reader is now the
+# unified queue itself, so the comparison is a tautology.
+CLOUD_ARCHIVE_SHADOW_PIPELINE_QUEUE = bool(
+    _cloud.get('shadow_pipeline_queue', False)
+)
+# ``CLOUD_ARCHIVE_USE_PIPELINE_READER`` — when True, the cloud worker
+# claims its next upload from
+# ``pipeline_queue.claim_next_for_stage(stage='cloud_pending')``
+# instead of disk-walking. PR-F3 added the reader; PR-F4 flips the
+# default to True. The legacy reader path is preserved behind False
+# only as a one-release rollback safety net.
+CLOUD_ARCHIVE_USE_PIPELINE_READER = bool(
+    _cloud.get('use_pipeline_reader', True)
+)
+
+# Phase 2.6 — bulk cloud sync retry cap. After this many consecutive
+# failures, the worker moves a row from 'failed' to 'dead_letter' and
+# excludes it from automatic re-picking. The Settings page allows
+# 1-20; values outside that range are clamped to the default at read
+# time (see cloud_archive_service._read_retry_max_attempts_setting).
+CLOUD_ARCHIVE_RETRY_MAX_ATTEMPTS = int(_cloud.get('retry_max_attempts', 5))
+
+# Phase 3a.2 (#98) — Unified Storage & Retention configuration.
+# Single source of truth for archive retention policies. Replaces the
+# legacy cleanup_config.json (auto-migrated on first boot) and supersedes
+# the scattered archive.retention_days / cloud_archive.archived_clips_retention_days
+# values (which remain as backward-compat fallbacks).
+_cleanup = config.get('cleanup', {}) if isinstance(config.get('cleanup'), dict) else {}
+CLEANUP_DEFAULT_RETENTION_DAYS = int(_cleanup.get('default_retention_days', 0))
+CLEANUP_FREE_SPACE_TARGET_PCT = int(_cleanup.get('free_space_target_pct', 10))
+CLEANUP_MAX_ARCHIVE_SIZE_GB = int(_cleanup.get('max_archive_size_gb', 0))
+CLEANUP_SHORT_RETENTION_WARNING_DAYS = int(_cleanup.get('short_retention_warning_days', 7))
+_cleanup_policies_raw = _cleanup.get('policies', {})
+CLEANUP_POLICIES = (
+    {str(k): dict(v) for k, v in _cleanup_policies_raw.items() if isinstance(v, dict)}
+    if isinstance(_cleanup_policies_raw, dict) else {}
+)
+
+# Phase 1 item 1.3 — "retention respects cloud". Controls whether the
+# archive_watchdog retention prune may delete clips that have NOT yet
+# been backed up to the cloud (status='synced' in cloud_synced_files).
+#
+#   None  → auto-default: protect un-uploaded clips when a cloud
+#           provider is configured; age-only deletion otherwise.
+#   False → "Keep clips until backed up to cloud" — past-cutoff clips
+#           that aren't synced yet are KEPT (and counted in the
+#           retention summary's kept_unsynced_count).
+#   True  → age-only deletion: clips past the cutoff are deleted
+#           regardless of cloud-sync status.
+#
+# Resolved on every prune; web UI changes take effect on the next pass
+# without a service restart. See ``services.archive_watchdog._resolve_delete_unsynced``.
+_delete_unsynced_raw = _cloud.get('delete_unsynced', None)
+CLOUD_ARCHIVE_DELETE_UNSYNCED = (
+    None if _delete_unsynced_raw is None else bool(_delete_unsynced_raw)
+)
+
+# Wave 4 PR-F4 (issue #184): the standalone Live Event Sync subsystem
+# has been removed. Live-event uploads are now first-class
+# ``pipeline_queue`` rows enqueued by the file_watcher's event.json
+# callback at ``PRIORITY_LIVE_EVENT`` (= 0), so the unified
+# cloud_archive worker picks them up before any bulk catch-up rows
+# automatically. The ``live_event_sync`` config block was removed
+# from config.yaml; this comment marks where the LIVE_EVENT_*
+# constants used to live so future readers can find the migration.
 
 # RecentClips Archive Configuration
 _archive = config.get('archive', {})
 ARCHIVE_ENABLED = bool(_archive.get('enabled', True))
-ARCHIVE_INTERVAL_MINUTES = int(_archive.get('interval_minutes', 5))
+ARCHIVE_INTERVAL_MINUTES = int(_archive.get('interval_minutes', 2))
 ARCHIVE_RETENTION_DAYS = int(_archive.get('retention_days', 30))
 ARCHIVE_MIN_FREE_SPACE_GB = int(_archive.get('min_free_space_gb', 10))
 ARCHIVE_MAX_SIZE_GB = int(_archive.get('max_size_gb', 50))
-ARCHIVE_ONLY_DRIVING = bool(_archive.get('only_driving', True))
 _archive_path = _archive.get('path', '')
 ARCHIVE_DIR = _archive_path if _archive_path else os.path.join(
     os.path.expanduser(f"~{TARGET_USER}"), 'ArchivedClips'
+)
+
+# Archive Queue Configuration (issue #76 — Phase 2a producers + Phase 2b worker)
+# Persistent SQLite-backed queue (in geodata.db) for the two-queue
+# archive pipeline. The inotify watcher, the 60-s rescan thread, and the
+# boot catch-up scan all enqueue rows into ``archive_queue``; the Phase
+# 2b worker thread drains them by copying source → ArchivedClips and
+# enqueueing the archived path into ``indexing_queue``. The whole
+# subsystem is unconditional now (issue #184 Wave 1) — the legacy
+# ``archive_queue.enabled`` and ``archive_queue.boot_catchup_enabled``
+# kill-switches were removed.
+_archive_queue = config.get('archive_queue', {})
+ARCHIVE_QUEUE_RESCAN_INTERVAL_SECONDS = float(
+    _archive_queue.get('rescan_interval_seconds', 60)
+)
+ARCHIVE_QUEUE_WORKER_CHECK_INTERVAL_SECONDS = float(
+    _archive_queue.get('worker_check_interval_seconds', 5)
+)
+ARCHIVE_QUEUE_RETRY_MAX_ATTEMPTS = int(
+    _archive_queue.get('retry_max_attempts', 3)
+)
+ARCHIVE_QUEUE_COPY_CHUNK_BYTES = int(
+    _archive_queue.get('copy_chunk_bytes', 1048576)
+)
+ARCHIVE_QUEUE_WATCHDOG_CHECK_INTERVAL_SECONDS = float(
+    _archive_queue.get('watchdog_check_interval_seconds', 60)
+)
+# SDIO-contention safeguards (issue: archive catch-up triggered hardware
+# watchdog reboot during a 1414-clip backlog drain). See archive_worker
+# docstring and copilot-instructions.md for the full failure mode.
+ARCHIVE_QUEUE_INTER_FILE_SLEEP_SECONDS = float(
+    _archive_queue.get('inter_file_sleep_seconds', 1.0)
+)
+ARCHIVE_QUEUE_LOAD_PAUSE_THRESHOLD = float(
+    _archive_queue.get('load_pause_threshold', 3.5)
+)
+ARCHIVE_QUEUE_LOAD_PAUSE_SECONDS = float(
+    _archive_queue.get('load_pause_seconds', 30)
+)
+ARCHIVE_QUEUE_BOOT_SCAN_DEFER_SECONDS = float(
+    _archive_queue.get('boot_scan_defer_seconds', 30)
+)
+# Mid-copy SDIO-contention safeguards (issue #104). The between-files
+# guard (load_pause_threshold/_seconds) only fires at the iteration
+# boundary; once _atomic_copy starts, nothing throttles it. These two
+# knobs add per-chunk + per-file safety nets that prevent a single
+# pathological copy from holding the lock long enough to starve the
+# userspace watchdog daemon (BCM2835 90s hardware-watchdog timeout).
+ARCHIVE_QUEUE_CHUNK_PAUSE_SECONDS = float(
+    _archive_queue.get('chunk_pause_seconds', 0.25)
+)
+ARCHIVE_QUEUE_PER_FILE_TIME_BUDGET_SECONDS = float(
+    _archive_queue.get('per_file_time_budget_seconds', 60.0)
+)
+# Phase 5.9 (issue #102) — additional advanced tunables.
+ARCHIVE_QUEUE_STABLE_WRITE_AGE_SECONDS = float(
+    _archive_queue.get('stable_write_age_seconds', 5.0)
+)
+ARCHIVE_QUEUE_RECENT_CLIPS_STABLE_WRITE_AGE_SECONDS = float(
+    _archive_queue.get('recent_clips_stable_write_age_seconds', 90.0)
+)
+ARCHIVE_QUEUE_PEEK_GIVE_UP_AGE_SECONDS = float(
+    _archive_queue.get('peek_give_up_age_seconds', 300.0)
+)
+ARCHIVE_QUEUE_STALE_CLAIM_MAX_AGE_SECONDS = float(
+    _archive_queue.get('stale_claim_max_age_seconds', 600.0)
+)
+# Wave 4 PR-E (issue #184): shadow-mode validation of pipeline_queue.
+# When True, the archive worker peeks at pipeline_queue before each
+# archive_queue claim and logs WARNING on disagreement. Pure
+# observability — no behavioural change.
+ARCHIVE_QUEUE_SHADOW_PIPELINE_QUEUE = bool(
+    _archive_queue.get('shadow_pipeline_queue', True)
+)
+
+# Wave 4 PR-F1 (issue #184): unified-queue reader cutover. When True,
+# the archive worker claims via pipeline_queue.claim_next_for_stage
+# instead of archive_queue.claim_next_for_worker. Defaults False so a
+# fresh deploy is a no-op; flip on after shadow telemetry agrees.
+ARCHIVE_QUEUE_USE_PIPELINE_READER = bool(
+    _archive_queue.get('use_pipeline_reader', False)
 )
 
 # ============================================================================

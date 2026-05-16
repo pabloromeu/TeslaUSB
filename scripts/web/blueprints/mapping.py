@@ -78,7 +78,7 @@ def map_view():
 @mapping_bp.route("/api/trips")
 def api_trips():
     """List trips with optional filters."""
-    from services.mapping_service import query_trips
+    from services.mapping_queries import query_trips
 
     limit = request.args.get('limit', 50, type=int)
     offset = request.args.get('offset', 0, type=int)
@@ -113,7 +113,7 @@ def api_trips():
 @mapping_bp.route("/api/trip/<int:trip_id>/route")
 def api_trip_route(trip_id):
     """Get GeoJSON route for a specific trip."""
-    from services.mapping_service import query_trip_route
+    from services.mapping_queries import query_trip_route
 
     try:
         waypoints = query_trip_route(MAPPING_DB_PATH, trip_id)
@@ -145,14 +145,66 @@ def api_trip_route(trip_id):
         }
         return jsonify(geojson)
     except Exception as e:
-        logger.error("Failed to query trip route: %s", e)
-        return jsonify({'error': str(e)}), 500
+        # Scrub the exception message from the response — raw SQL
+        # fragments / file paths could leak in error.message and
+        # surface to any browser that happens to be on the AP.
+        # Full traceback is preserved in the server log.
+        logger.exception("Failed to query trip route: %s", e)
+        return jsonify({'error': 'internal error'}), 500
+
+
+@mapping_bp.route("/api/trip/<int:trip_id>/telemetry")
+def api_trip_telemetry(trip_id):
+    """Return cold telemetry (steering/brake/accel/gear/blinker) for
+    every waypoint in ``trip_id`` keyed by waypoint id.
+
+    Issue #184 Wave 3 — Phase D companion to ``/api/trip/<id>/route``.
+    The map polyline endpoint returns hot columns only (lat/lon/
+    speed/heading/autopilot_state). When the user opens the in-clip
+    HUD overlay, the JS calls this endpoint once and merges the
+    cold payload into the existing waypoints array.
+
+    Response shape::
+
+        {
+            "trip_id": <int>,
+            "telemetry": {
+                "<waypoint_id>": {
+                    "id": <int>,
+                    "acceleration_x": <float|null>,
+                    "acceleration_y": <float|null>,
+                    "acceleration_z": <float|null>,
+                    "gear": <str|null>,
+                    "steering_angle": <float|null>,
+                    "brake_applied": <0|1>,
+                    "blinker_on_left": <0|1>,
+                    "blinker_on_right": <0|1>
+                },
+                ...
+            }
+        }
+
+    Empty ``telemetry`` is a valid response (parked-only trip).
+    """
+    from services.mapping_queries import query_trip_telemetry
+    try:
+        telem = query_trip_telemetry(MAPPING_DB_PATH, trip_id)
+        return jsonify({
+            'trip_id': trip_id,
+            'telemetry': {str(wp_id): row for wp_id, row in telem.items()},
+        })
+    except Exception as e:
+        # Scrub the exception message from the response — raw SQL
+        # fragments / file paths could leak in error.message. Full
+        # traceback is preserved in the server log.
+        logger.exception("Failed to query trip telemetry: %s", e)
+        return jsonify({'error': 'internal error'}), 500
 
 
 @mapping_bp.route("/api/waypoints-for-clip")
 def api_waypoints_for_clip():
     """Look up waypoints matching a video clip path (or nearby clips in same trip)."""
-    from services.mapping_service import get_db_connection
+    from services.mapping_queries import get_db_connection
 
     video_path = request.args.get('path', '')
     if not video_path:
@@ -172,7 +224,7 @@ def api_waypoints_for_clip():
             # Sort by timestamp (id as tiebreaker): id-only ordering breaks
             # when late-indexed videos or merged trips give waypoints non-
             # monotonic ids relative to their timestamps. See
-            # mapping_service.query_day_routes docstring for the full story.
+            # mapping_queries.query_day_routes docstring for the full story.
             trip_id = rows[0]['trip_id']
             all_wps = conn.execute(
                 """SELECT * FROM waypoints WHERE trip_id = ?
@@ -214,7 +266,7 @@ def api_waypoints_for_clip():
 @mapping_bp.route("/api/events")
 def api_events():
     """List detected events with optional filters."""
-    from services.mapping_service import query_events
+    from services.mapping_queries import query_events
 
     # When ``date`` is supplied the request is asking for a complete
     # day's worth of markers (the map renders all of them). Allow up
@@ -305,7 +357,7 @@ def api_days():
       * ``min_distance`` — trip distance threshold in km
         (default 0.05 = 50 m). Pass 0 to include parking blips.
     """
-    from services.mapping_service import query_days
+    from services.mapping_queries import query_days
 
     limit = request.args.get('limit', _DAYS_LIMIT_DEFAULT, type=int)
     if limit is None or limit <= 0:
@@ -355,7 +407,7 @@ def api_day_routes(date):
           ]
         }
     """
-    from services.mapping_service import query_day_routes
+    from services.mapping_queries import query_day_routes
 
     if not _DATE_RE.match(date):
         return jsonify({'error': 'date must be YYYY-MM-DD'}), 400
@@ -383,6 +435,69 @@ def api_day_routes(date):
     except Exception as e:  # noqa: BLE001
         logger.error("Failed to query day routes: %s", e)
         return jsonify({'error': str(e)}), 500
+
+
+@mapping_bp.route("/api/trips/playable")
+def api_trips_playable():
+    """Return which trips on a given day still have playable video on disk.
+
+    Powers the disambiguation popup's ghost-trip filter (issue #77):
+    a trip whose ``waypoints.video_path`` rows reference clips that
+    Tesla has rotated out of RecentClips (and that the archive job
+    didn't copy in time) should not appear in the chooser, because
+    picking one yields an unhelpful "No video available" toast.
+
+    The check is per-trip — a trip is "playable" iff at least one of
+    its waypoints' video paths resolves to a real file on disk via
+    the same fallback rules :func:`videos.stream_video` uses
+    (RecentClips → ArchivedClips). Per-day results are cached
+    server-side for 60 s; subsequent calls within that window are
+    served from memory.
+
+    Query params:
+      * ``date`` — ISO ``YYYY-MM-DD`` (required).
+
+    Response shape::
+
+        {
+          "date": "2026-05-07",
+          "trips": {"62": false, "63": true, ...}
+        }
+
+    Trip ids are JSON-stringified because JSON object keys must be
+    strings; the client coerces them back to numbers.
+    """
+    from services.mapping_queries import playable_trips_for_date
+
+    date = request.args.get('date', '')
+    if not _DATE_RE.match(date):
+        return jsonify({'error': 'date must be YYYY-MM-DD'}), 400
+
+    try:
+        from config import ARCHIVE_DIR, ARCHIVE_ENABLED
+        archive_dir = ARCHIVE_DIR if ARCHIVE_ENABLED else None
+    except ImportError:
+        archive_dir = None
+
+    teslacam_path = get_teslacam_path()
+
+    try:
+        result = playable_trips_for_date(
+            MAPPING_DB_PATH, date,
+            teslacam_path=teslacam_path,
+            archive_dir=archive_dir,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("Failed to compute playable trips for %s: %s",
+                     date, e)
+        return jsonify({'error': str(e)}), 500
+
+    # Stringify keys for JSON compatibility; the client expects this
+    # and coerces them back via Number() / parseInt().
+    return jsonify({
+        'date': date,
+        'trips': {str(k): v for k, v in result.items()},
+    })
 
 
 # Maximum simplified waypoints per trip in /api/all-routes. With
@@ -429,7 +544,7 @@ def api_all_routes():
           ]
         }
     """
-    from services.mapping_service import query_all_routes_simplified
+    from services.mapping_queries import query_all_routes_simplified
 
     min_distance_km = request.args.get(
         'min_distance', _DEFAULT_DAY_MIN_DISTANCE_KM, type=float
@@ -482,7 +597,7 @@ def api_all_routes():
 @mapping_bp.route("/api/stats")
 def api_stats():
     """Get summary statistics."""
-    from services.mapping_service import get_stats
+    from services.mapping_queries import get_stats
 
     try:
         return jsonify(get_stats(MAPPING_DB_PATH))
@@ -594,7 +709,8 @@ def api_index_rebuild():
         }), 400
 
     import sqlite3
-    from services.mapping_service import boot_catchup_scan, clear_all_queue
+    from services.mapping_service import boot_catchup_scan
+    from services.indexing_queue_service import clear_all_queue
     from services import indexing_worker
 
     # Pause the worker for the destructive sweep so it can't be
@@ -646,7 +762,7 @@ def api_index_cancel():
     in-flight work isn't wasted. Useful if a user accidentally
     triggered a rebuild on a Pi with thousands of clips.
     """
-    from services.mapping_service import clear_pending_queue
+    from services.indexing_queue_service import clear_pending_queue
     try:
         n = clear_pending_queue(MAPPING_DB_PATH)
     except Exception as e:  # noqa: BLE001
@@ -685,7 +801,7 @@ def api_index_diagnose():
 @mapping_bp.route("/api/driving-stats")
 def api_driving_stats():
     """Get driving behavior statistics."""
-    from services.mapping_service import get_driving_stats
+    from services.mapping_queries import get_driving_stats
     try:
         return jsonify(get_driving_stats(MAPPING_DB_PATH))
     except Exception as e:
@@ -696,7 +812,7 @@ def api_driving_stats():
 @mapping_bp.route("/api/event-charts")
 def api_event_charts():
     """Get event data formatted for Chart.js."""
-    from services.mapping_service import get_event_chart_data
+    from services.mapping_queries import get_event_chart_data
     try:
         return jsonify(get_event_chart_data(MAPPING_DB_PATH))
     except Exception as e:
@@ -716,7 +832,7 @@ def api_sentry_events():
     data; the client lazily fetches per-event details via
     :func:`api_event_details` for cards as they scroll into view.
     """
-    from services.mapping_service import query_events
+    from services.mapping_queries import query_events
 
     try:
         # Fetch ALL detected events — sentry, saved, and driving events

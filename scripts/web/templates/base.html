@@ -35,6 +35,23 @@
             </a>
         </div>
         <div class="top-bar-right">
+            {# Phase 4.8 (#101) — system-health status dot. Polls
+               /api/system/health every 30 s. Color = overall severity:
+               ok=green, warn=amber, error=red, unknown=gray.
+               Click navigates to Settings (where the Phase 4.2
+               system-health card shows the per-subsystem breakdown).
+               Hidden until first poll arrives so we never flash a
+               stale color. #}
+            <a href="{{ url_for('mode_control.index') }}#system-health-card"
+               class="health-dot-link"
+               id="health-dot-link"
+               title="System status"
+               aria-label="System status"
+               hidden>
+                <span class="status-dot health-dot"
+                      id="health-dot"
+                      data-status-dot="health"></span>
+            </a>
             <span class="status-dot {% if mode_token == 'present' %}status-present{% elif mode_token == 'edit' %}status-edit{% else %}status-unknown{% endif %}" title="{{ mode_label }}"></span>
             <button class="theme-toggle-btn" onclick="toggleTheme()" aria-label="Toggle dark mode">
                 <svg class="nav-icon" id="theme-icon-svg" aria-hidden="true">
@@ -109,6 +126,40 @@
     </nav>
 
     <main class="main-content{% if expandable %} expandable{% endif %}" role="main">
+        {% if videos_available %}
+        <!-- Phase 2c: archive watchdog banner. Hidden by default; the
+             polling JS below shows it when /api/archive/status returns
+             severity 'error' or 'critical'. Dismiss is sticky for 1h. -->
+        <div class="archive-watchdog-banner" id="archive-watchdog-banner"
+             role="alert" aria-live="polite" hidden>
+            <div class="archive-watchdog-content">
+                <div class="archive-watchdog-icon">
+                    <svg class="nav-icon" aria-hidden="true">
+                        <use id="archive-watchdog-icon-use"
+                             href="{{ url_for('static', filename='icons/lucide-sprite.svg') }}#icon-alert-triangle"></use>
+                    </svg>
+                </div>
+                <div class="archive-watchdog-message" id="archive-watchdog-message">
+                    Archive subsystem health degraded.
+                </div>
+                <div class="archive-watchdog-actions">
+                    <button type="button"
+                            class="archive-watchdog-btn"
+                            id="archive-watchdog-run-btn"
+                            aria-label="Run archive now">
+                        Run archive now
+                    </button>
+                    <button type="button"
+                            class="archive-watchdog-btn archive-watchdog-btn-secondary"
+                            id="archive-watchdog-dismiss-btn"
+                            aria-label="Dismiss banner for 1 hour">
+                        Dismiss
+                    </button>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
         {% if operation_in_progress %}
         <div class="operation-banner" id="operation-banner">
             <div class="operation-content">
@@ -157,6 +208,180 @@
         window.lockAge = {{ lock_age|default(0) }};
     </script>
     {% endif %}
+    {% if videos_available %}
+    <script>
+        // Phase 2c: archive watchdog banner — polls /api/archive/status
+        // every 60 s and shows a sticky bar when severity is 'error' or
+        // 'critical'. Dismiss persists for 1 h via sessionStorage.
+        (function() {
+            const POLL_INTERVAL_MS = 60000;
+            const DISMISS_KEY = 'archiveWatchdogDismissUntil';
+            const banner = document.getElementById('archive-watchdog-banner');
+            if (!banner) return;
+            const messageEl = document.getElementById('archive-watchdog-message');
+            const iconUse = document.getElementById('archive-watchdog-icon-use');
+            const runBtn = document.getElementById('archive-watchdog-run-btn');
+            const dismissBtn = document.getElementById('archive-watchdog-dismiss-btn');
+            const SPRITE = '{{ url_for("static", filename="icons/lucide-sprite.svg") }}';
+
+            function dismissedNow() {
+                try {
+                    const until = parseInt(
+                        sessionStorage.getItem(DISMISS_KEY) || '0', 10);
+                    return Date.now() < until;
+                } catch (e) { return false; }
+            }
+
+            function applySeverity(severity, message) {
+                banner.classList.remove(
+                    'archive-watchdog-warning',
+                    'archive-watchdog-error',
+                    'archive-watchdog-critical');
+                let icon = 'icon-alert-triangle';
+                if (severity === 'critical') {
+                    banner.classList.add('archive-watchdog-critical');
+                    icon = 'icon-shield-alert';
+                } else if (severity === 'error') {
+                    banner.classList.add('archive-watchdog-error');
+                    icon = 'icon-alert-circle';
+                }
+                if (iconUse) iconUse.setAttribute('href', SPRITE + '#' + icon);
+                if (messageEl) messageEl.textContent = message || '';
+            }
+
+            async function poll() {
+                if (dismissedNow()) {
+                    banner.hidden = true;
+                    return;
+                }
+                try {
+                    const r = await fetch('/api/archive/status', {
+                        credentials: 'same-origin',
+                    });
+                    if (!r.ok) { banner.hidden = true; return; }
+                    const data = await r.json();
+                    // Issue #180 follow-up — banner is gated on
+                    // BOTH severity (error/critical) AND actionable
+                    // (the user can actually fix the underlying
+                    // issue). Stale-only conditions where the
+                    // worker is doing its best under heavy backlog
+                    // are reported in the System Health card but
+                    // never popped as a banner — banners that the
+                    // operator has no remedy for are pure noise.
+                    const sevBad = data.severity === 'error'
+                        || data.severity === 'critical';
+                    // Default to true when the field is missing so
+                    // an older deployment without the actionable
+                    // flag still surfaces the banner as before.
+                    const actionable = (data.actionable !== false);
+                    if (sevBad && actionable) {
+                        applySeverity(data.severity, data.message);
+                        banner.hidden = false;
+                    } else {
+                        banner.hidden = true;
+                    }
+                } catch (e) {
+                    // Network blip — leave the banner state unchanged.
+                }
+            }
+
+            if (runBtn) {
+                runBtn.addEventListener('click', async function() {
+                    runBtn.disabled = true;
+                    try {
+                        const r = await fetch(
+                            '/api/recent_archive/trigger',
+                            { method: 'POST',
+                              credentials: 'same-origin' });
+                        if (typeof showToast === 'function') {
+                            showToast(
+                                r.ok
+                                ? 'Archive run triggered.'
+                                : 'Failed to trigger archive run.',
+                                r.ok ? 'success' : 'error');
+                        }
+                    } catch (e) {
+                        if (typeof showToast === 'function') {
+                            showToast('Network error triggering archive.',
+                                'error');
+                        }
+                    } finally {
+                        runBtn.disabled = false;
+                        setTimeout(poll, 2000);
+                    }
+                });
+            }
+            if (dismissBtn) {
+                dismissBtn.addEventListener('click', function() {
+                    try {
+                        sessionStorage.setItem(
+                            DISMISS_KEY,
+                            String(Date.now() + 60 * 60 * 1000));
+                    } catch (e) {}
+                    banner.hidden = true;
+                });
+            }
+
+            poll();
+            setInterval(poll, POLL_INTERVAL_MS);
+        })();
+    </script>
+    {% endif %}
+
+    {# Phase 4.8 (#101) — system-health status dot in the top-bar.
+       Polls /api/system/health every 30 s; colours the dot per the
+       overall.severity (ok/warn/error/unknown). Hidden until the
+       first response arrives so we never flash a stale colour.
+       Lives outside the videos_available guard above because system
+       health is a global concern (cloud, WiFi, disk all matter even
+       on a Pi without a TeslaCam image). #}
+    <script>
+        (function() {
+            const POLL_MS = 30000;
+            const link = document.getElementById('health-dot-link');
+            const dot = document.getElementById('health-dot');
+            if (!link || !dot) return;
+
+            // Map subsystem severity → CSS class + tooltip prefix.
+            // Matches the tokens defined in style.css for the existing
+            // mode status-dot vocabulary (status-present uses --mode-present
+            // = green, status-edit uses --mode-edit = blue) and uses the
+            // design-system accent tokens for warn/error so dark/light
+            // mode work automatically.
+            const SEV_TO_CLASS = {
+                ok:      'health-dot-ok',
+                warn:    'health-dot-warn',
+                error:   'health-dot-error',
+                unknown: 'health-dot-unknown',
+            };
+
+            function applyHealth(payload) {
+                const overall = (payload && payload.overall) || {};
+                const sev = overall.severity || 'unknown';
+                const msg = overall.message || 'System status';
+                // Reset any prior class then apply the new one.
+                dot.className = 'status-dot health-dot ' +
+                    (SEV_TO_CLASS[sev] || SEV_TO_CLASS.unknown);
+                link.title = msg;
+                link.setAttribute('aria-label', msg);
+                link.hidden = false;
+            }
+
+            async function poll() {
+                try {
+                    const r = await fetch('/api/system/health', {
+                        credentials: 'same-origin',
+                    });
+                    if (!r.ok) return;
+                    const data = await r.json();
+                    applyHealth(data);
+                } catch (e) { /* network blip — keep last known colour */ }
+            }
+
+            poll();
+            setInterval(poll, POLL_MS);
+        })();
+    </script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

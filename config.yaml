@@ -97,18 +97,16 @@ web:
 # ============================================================================
 mapping:
   enabled: true                          # Enable GPS/telemetry indexing of dashcam videos
-  index_on_startup: true                 # DEPRECATED — no effect; persistent queue + worker handles this automatically
-  index_on_mode_switch: true             # DEPRECATED — no effect; mode switch already triggers a catch-up scan
   sample_rate: 30                        # Extract every Nth frame (30 = ~1/sec at 30fps)
   trip_gap_minutes: 5                    # Gap between waypoints to start a new trip
-  archive_indexing: true                 # Index ArchivedClips on SD card during WiFi connect
+  # Phase 5.9 (issue #102) — exposed via Settings → Advanced.
+  index_too_new_seconds: 120             # Skip indexing for clips whose mtime is fresher than this many seconds (Tesla still writing)
   event_detection:
     harsh_brake_threshold: -4.0          # m/s² longitudinal (negative = braking)
     emergency_brake_threshold: -7.0      # m/s² longitudinal
     hard_accel_threshold: 3.5            # m/s² longitudinal (positive = accelerating)
     sharp_turn_lateral_g: 4.0            # m/s² lateral
     speed_limit_mps: 35.76              # ~80 mph speed alert threshold (0 = disabled)
-    fsd_disengage_detect: true           # Detect FSD engagement/disengagement events
 
 # ============================================================================
 # Cloud Archive Configuration
@@ -123,11 +121,11 @@ cloud_archive:
   sync_folders:                          # Which TeslaCam subfolders to sync
     - SentryClips
     - SavedClips
-    - RecentClips
+    - ArchivedClips                      # SD-card-resident copy of clips (RecentClips rotates hourly, so we sync the archived snapshot instead)
   priority_order:                        # Sync priority (first = highest, user-configurable)
     - SentryClips
     - SavedClips
-    - RecentClips
+    - ArchivedClips
   max_upload_mbps: 5                     # Bandwidth limit (Pi has limited upload)
   cloud_reserve_gb: 1                    # Keep this much free on cloud (don't fill to 100%)
   keep_local_after_upload: true          # Keep local files after uploading to cloud
@@ -135,28 +133,111 @@ cloud_archive:
   cloud_auto_cleanup: false              # Auto-delete old cloud videos when storage is low
   cloud_cleanup_threshold_pct: 90        # Delete when cloud usage exceeds this %
   cloud_min_retention_days: 30           # Keep at least this many days of videos
+  # Phase 2c (issue #76) — local ArchivedClips storage management on the SD card.
+  # The retention prune walks ~/ArchivedClips and deletes *.mp4 files older than
+  # this many days; trip/waypoint/event rows in geodata.db are preserved (only
+  # their video_path pointer is nulled). Disk-space guard refuses new copies and
+  # logs CRITICAL when the SD card free space drops below disk_space_critical_mb.
+  archived_clips_retention_days: 30      # Local SD-card retention for ArchivedClips/*.mp4
+  # Phase 2.6 — bulk cloud sync retry cap. After this many consecutive
+  # failures, a row moves from 'failed' to 'dead_letter' and is excluded
+  # from automatic re-picking. Failed rows can still be retried manually
+  # from the Failed Jobs page (Phase 4) or by manually setting status
+  # back to 'pending' in cloud_sync.db.
+  retry_max_attempts: 5                  # 1-20; default 5
+  # Phase 1 item 1.3 — "retention respects cloud". Controls whether the
+  # retention prune is allowed to delete clips that have NOT yet been
+  # backed up to the cloud (status='synced' in cloud_synced_files.db).
+  #   null  → auto: keep un-uploaded clips when a provider is configured,
+  #           age-only deletion otherwise (recommended default).
+  #   false → "Keep clips until backed up" — protect un-uploaded clips
+  #           past the retention cutoff. Surfaced as the toggle on
+  #           Settings → Cloud Sync.
+  #   true  → age-only deletion (loses footage that was awaiting upload).
+  delete_unsynced: null
+  disk_space_warning_mb: 500             # Log WARNING when SD-card free space drops below this
+  disk_space_critical_mb: 100            # Refuse new archive copies when free space drops below this
+  disk_space_pause_seconds: 300          # How long the worker stays paused after a disk-critical refusal
+
+  # Wave 4 (issue #184): unified ``pipeline_queue`` integration.
+  #
+  # The cloud worker now reads its work from the unified
+  # ``pipeline_queue`` (added in PR-A → PR-F3). The flags below are
+  # the cutover knobs. PR-F4 flipped them ON by default; existing
+  # installs upgrading from a pre-PR-F4 release will automatically
+  # adopt the unified pipeline on next service restart.
+  #
+  # ``enqueue_to_pipeline`` — PRODUCER hook. When true, every event
+  # discovered by ``_discover_events`` is also enqueued into
+  # ``pipeline_queue`` with ``stage='cloud_pending'`` (idempotent via
+  # the existing UNIQUE index). Default ``true`` (was ``false`` until
+  # PR-F4) — operators who need to roll back to the legacy disk-walk
+  # path can flip this off.
+  enqueue_to_pipeline: true
+  # ``shadow_pipeline_queue`` — OBSERVABILITY shim used during the
+  # cutover. Compares the legacy reader's first pick against the
+  # ``pipeline_queue`` top-N and logs a WARNING on disagreement.
+  # Default ``false`` (was ``true`` until PR-F4) — the reader is now
+  # the unified queue itself, so the comparison is a tautology.
+  shadow_pipeline_queue: false
+  # ``use_pipeline_reader`` — when true, the cloud worker claims its
+  # next upload from ``pipeline_queue.claim_next_for_stage(stage=
+  # 'cloud_pending')`` instead of disk-walking. PR-F3 added the
+  # reader; PR-F4 flips the default to ``true``. The legacy reader
+  # path is preserved behind ``false`` only as a one-release rollback
+  # safety net; it will be removed entirely in a follow-up.
+  use_pipeline_reader: true
 
 # ============================================================================
-# Live Event Sync Configuration
+# Storage & Retention Configuration (Phase 3a.2 — closes part of #98)
 # ============================================================================
-# Real-time upload of Sentry/Saved events as soon as Tesla writes the
-# event.json metadata. Separate first-class subsystem from cloud_archive:
-#   - own enable flag, queue, and worker thread
-#   - shares only the cloud provider credentials (configured in the web UI)
-#   - takes priority over cloud_archive when both want WiFi
-#   - persists the queue across reboots and WiFi outages
-# Pi Zero 2 W resource budget: < 25 MB RSS steady state, < 0.1% idle CPU.
-live_event_sync:
-  enabled: false                         # Opt-in default; existing installs unchanged
-  watch_folders:                         # Tesla event subfolders to react to
-    - SentryClips
-    - SavedClips
-  upload_scope: "event_minute"           # event_minute = 6 cams + event.json (~150-200 MB);
-                                         # event_folder = all .mp4 in the event dir (~0.7-2 GB)
-  retry_max_attempts: 5                  # Move row to 'failed' after this many attempts
-  retry_backoff_seconds: [30, 120, 300, 900, 3600]  # 30s, 2m, 5m, 15m, 1h
-  daily_data_cap_mb: 0                   # 0 = unlimited; pause uploads when exceeded
-  notify_webhook_url: ""                 # Optional POST URL on successful upload
+# Single source of truth for archive/clip retention policies. Replaces the
+# legacy ``cleanup_config.json`` (auto-migrated on first boot) and
+# the scattered ``archive.retention_days`` / ``cloud_archive.archived_clips_retention_days``
+# values (which remain as backward-compat fallbacks).
+#
+# Surfaced in the web UI under Settings → Storage & Retention so users can
+# manage retention without SSHing in. All changes take effect on the next
+# retention pass (no service restart needed).
+cleanup:
+  # 0 = inherit from the legacy fallback chain
+  # (cloud_archive.archived_clips_retention_days → archive.retention_days → 30).
+  # The startup migration seeds this from the legacy keys on first boot so
+  # existing customizations carry over without a behavior change. Saving from
+  # the Settings UI also writes a concrete value here, making this the unified
+  # source of truth from that point on.
+  default_retention_days: 0
+  free_space_target_pct: 10              # Try to keep at least this % of SD-card capacity free; aggressive prune below this
+  max_archive_size_gb: 0                 # Hard cap on total ArchivedClips size; 0 = no cap (time-based retention only) — Phase 5 wires the cap into the prune
+  short_retention_warning_days: 7        # Warn in the UI when default retention drops below this
+  policies:                              # Per-folder overrides (empty dict = use defaults everywhere)
+    # Examples (uncomment to override the default for a specific folder):
+    # SentryClips:
+    #   enabled: false
+    #   retention_days: 90
+    # SavedClips:
+    #   enabled: false
+    #   retention_days: 365
+    # RecentClips:
+    #   enabled: false
+    #   retention_days: 30
+    # ArchivedClips:
+    #   enabled: true
+    #   retention_days: 30
+
+# Wave 4 PR-F4 (issue #184): the standalone ``live_event_sync``
+# configuration block has been removed. Live-event uploads (Sentry/
+# Saved) are now first-class ``pipeline_queue`` rows enqueued by the
+# file_watcher event.json hook at ``PRIORITY_LIVE_EVENT`` (= 0), so
+# the unified cloud_archive worker picks them up before any bulk
+# catch-up rows automatically. There is no separate enable flag,
+# queue, worker, retry policy, or daily data cap — the
+# ``cloud_archive`` retry/cap settings apply to live events too.
+# (The previous ``live_event_sync.upload_scope: "event_minute"``
+# camera-subset selection is gone; live events upload the full event
+# directory, same as bulk events. The "minute-only" optimisation was
+# undocumented in the public docs and almost no Tesla event spans
+# more than a minute anyway.)
 
 # ============================================================================
 # RecentClips Archive Configuration
@@ -165,9 +246,79 @@ live_event_sync:
 # SD card before Tesla's 1-hour circular buffer deletes them. Zero USB disruption.
 archive:
   enabled: true                          # Enable RecentClips archival
-  interval_minutes: 5                    # How often to check for new clips (tighter = less data loss)
+  interval_minutes: 2                    # How often to check for new clips (tighter = less data loss)
   retention_days: 30                     # Delete archived clips older than this
-  min_free_space_gb: 10                  # Hard floor — stop archiving if SD card < this free
+  min_free_space_gb: 20                  # Hard floor — stop archiving if SD card < this free. Issue #109: raised from 10 → 20 GiB. On a typical 470 GiB SD card, 10 GiB ≈ 2.1% free, which is well below the point at which ext4 free-block-group search starts thrashing and inflates per-write cost 10–100×, starving the watchdog daemon. 20 GiB ≈ 4.2% gives ext4 enough headroom to keep writes cheap.
   max_size_gb: 0                         # 0 = auto (use all available space minus reserved)
-  only_driving: true                     # Only archive clips from active driving trips (skip idle/parked)
   path: ""                               # Archive path (default: ~/ArchivedClips, set by web app)
+  # Stationary RecentClips skip-at-source is now unconditional (issue #184
+  # Wave 1). The archive worker peeks at each RecentClips candidate's SEI
+  # metadata; clips with no GPS-bearing SEI message are marked
+  # ``skipped_stationary`` instead of being copied. Sentry/Saved event
+  # clips are PRIORITY_EVENTS and never enter the skip path. The reclaim
+  # button on the Storage & Retention card still cleans up already-archived
+  # stationary RecentClips from before this default was in effect.
+
+# ============================================================================
+# Archive Queue Configuration (issue #76)
+# ============================================================================
+# Persistent SQLite-backed queue (in geodata.db) for the two-queue archive
+# pipeline. Three producers populate the queue: the inotify file watcher,
+# a periodic full-directory rescan, and a one-shot boot catch-up scan.
+# The Phase 2b worker drains the queue one file at a time. The whole
+# subsystem is unconditional now (issue #184 Wave 1) — disabling it left
+# the gadget in a degraded state with no recourse for catch-up after an
+# unclean shutdown, so the kill-switch was removed.
+archive_queue:
+  rescan_interval_seconds: 60            # Cadence of the periodic full-dir rescan
+  worker_check_interval_seconds: 5       # Idle/empty-queue sleep between worker iterations
+  retry_max_attempts: 3                  # OSError retries before a row goes to dead_letter
+  copy_chunk_bytes: 1048576              # Chunk size (1 MiB) for the temp+fsync+rename copy
+  # Phase 2c (issue #76) — health watchdog cadence.
+  watchdog_check_interval_seconds: 60    # Frequency of the archive-health watchdog tick
+  # SDIO-bus contention safeguards. The Pi Zero 2 W shares one SDIO
+  # controller between the SD card and the WiFi chip; aggressive
+  # archive copies can starve the kernel watchdog daemon and trigger
+  # a hardware reset. These knobs let the worker back off under load.
+  inter_file_sleep_seconds: 1.0          # Sleep between successful copies (was 0.25)
+  load_pause_threshold: 3.5              # Pause when 1-min loadavg exceeds this
+  load_pause_seconds: 30                 # How long to sleep when load is high
+  boot_scan_defer_seconds: 30            # Producer waits this long after start before its first scan
+  # Mid-copy SDIO-contention safeguards (issue #104). The
+  # between-files load-pause guard above only fires at the iteration
+  # boundary; once a single _atomic_copy starts, nothing throttles it.
+  # Under sustained SDIO saturation a 25-50 MB clip copy can take
+  # 3-6 minutes, starving the userspace watchdog daemon long enough
+  # to trigger the BCM2835 hardware watchdog (90s timeout). These two
+  # knobs add per-chunk and per-file safety nets inside _atomic_copy.
+  chunk_pause_seconds: 0.25              # Sleep between chunks when 1-min loadavg > load_pause_threshold (issue #104 mitigation A)
+  per_file_time_budget_seconds: 60.0     # Abort + requeue (no attempts bump) any single copy taking longer than this (issue #104 mitigation B)
+  # Phase 5.9 (issue #102) — additional advanced tunables exposed via
+  # the Settings → Advanced sub-page so power users can tune without
+  # editing this file by SSH.
+  stable_write_age_seconds: 5.0          # Re-queue clips whose mtime is fresher than this many seconds (avoids copying mid-write)
+  recent_clips_stable_write_age_seconds: 90.0  # Higher threshold for RecentClips (Tesla writes ~60s segments; moov atom appended at close — see archive_worker._CopyMoovIncomplete)
+  peek_give_up_age_seconds: 300.0        # If SEI peek raises a parser error AND file mtime is older than this, treat as stationary (skip) instead of falling through to copy — prevents queue cascade when VFS page cache holds a stale view of files Tesla wrote via the gadget block layer
+  stale_claim_max_age_seconds: 600.0     # Reset 'claimed' rows older than this back to 'pending' on worker startup (recovers crashed/OOMed claims)
+  # Wave 4 PR-E (issue #184): shadow-mode validation of the unified
+  # ``pipeline_queue``. When enabled, the archive worker peeks at
+  # ``pipeline_queue`` immediately before each ``archive_queue`` claim
+  # and logs a WARNING if the two readers disagree on which row is
+  # next. Pure observability — no behavioural change. Used to verify
+  # the dual-write produces correct ordering against real production
+  # traffic before PR-F cuts over the actual reader. Disable to
+  # silence the (cheap) extra peek; default ``true`` so we get
+  # production validation data while it's still cheap to fix
+  # mismatches.
+  shadow_pipeline_queue: true
+
+  # Wave 4 PR-F1 (issue #184): unified-queue reader cutover.
+  # When enabled, the archive worker claims its next row from
+  # ``pipeline_queue`` (via ``claim_next_for_stage``) instead of from
+  # the legacy ``archive_queue``. The legacy table continues to receive
+  # state mirrors via the existing dual-write hooks so it stays a
+  # consistent shadow during the cutover. Default ``false`` so a fresh
+  # deploy is a no-op; flip to ``true`` after PR-E shadow telemetry
+  # confirms the two readers agree on production traffic. Reverting is
+  # a single config-flag flip — no DB rollback needed.
+  use_pipeline_reader: false

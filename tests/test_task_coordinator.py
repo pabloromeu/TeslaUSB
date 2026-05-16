@@ -27,12 +27,16 @@ def _reset_coordinator():
         tc._current_task = None
         tc._task_started = 0.0
         tc._waiter_count = 0
+        tc._skipped_log_last.clear()
+        tc._task_stats.clear()
     yield
     # Post-test cleanup.
     with tc._lock:
         tc._current_task = None
         tc._task_started = 0.0
         tc._waiter_count = 0
+        tc._skipped_log_last.clear()
+        tc._task_stats.clear()
 
 
 class TestBasicAcquireRelease:
@@ -338,3 +342,400 @@ class TestMultipleWaiters:
             "applied to a blocking caller"
         )
         tc.release_task('holder')
+
+
+class TestSkippedLogThrottling:
+    """Issue #72: the cyclic indexer hits the "skipped" log path every
+    ~0.5 s while the archive holds the lock. A long archive run was
+    producing ~2 INFO log lines/sec for ~11 minutes (~1300 entries) on
+    Pi production, filling the journal and obscuring real events.
+    Throttle the INFO log to once per (task, blocker) pair per
+    ``_SKIPPED_LOG_THROTTLE_SECONDS``; demote subsequent attempts to
+    DEBUG so they remain available via ``journalctl -p debug``.
+    """
+
+    def test_repeated_skips_log_info_only_once(self, caplog):
+        tc.acquire_task('archive')
+        try:
+            with caplog.at_level('INFO', logger='services.task_coordinator'):
+                # Hit the skip path 10 times in quick succession.
+                for _ in range(10):
+                    assert tc.acquire_task('indexer') is False
+
+            info_skips = [
+                r for r in caplog.records
+                if r.levelname == 'INFO' and 'skipped' in r.message
+            ]
+            assert len(info_skips) == 1, (
+                f"Expected exactly 1 INFO 'skipped' log, got "
+                f"{len(info_skips)}: "
+                f"{[r.getMessage() for r in info_skips]}"
+            )
+        finally:
+            tc.release_task('archive')
+
+    def test_repeated_skips_emit_debug_after_first(self, caplog):
+        tc.acquire_task('archive')
+        try:
+            with caplog.at_level('DEBUG', logger='services.task_coordinator'):
+                for _ in range(5):
+                    assert tc.acquire_task('indexer') is False
+
+            info_skips = [
+                r for r in caplog.records
+                if r.levelname == 'INFO' and 'skipped' in r.message
+            ]
+            debug_skips = [
+                r for r in caplog.records
+                if r.levelname == 'DEBUG' and 'skipped' in r.message
+            ]
+            assert len(info_skips) == 1
+            # 4 throttled attempts → 4 DEBUG logs.
+            assert len(debug_skips) == 4
+        finally:
+            tc.release_task('archive')
+
+    def test_new_blocker_pair_logs_at_info_after_lock_change(self, caplog):
+        """Issue #172: when the lock changes hands, a SKIP against a
+        newly-encountered blocker should still fire INFO on its first
+        attempt (because no entry exists in the throttle map for that
+        ``(task, blocker)`` pair).
+
+        Note: prior to issue #172 the throttle map was wiped on every
+        successful acquire, which produced log spam under rapid task
+        interleave. The post-#172 behavior leaves the map intact and
+        relies on the per-pair 60s window, but a brand-new pair like
+        ``(indexer, cloud_sync)`` still has no entry → still fires
+        INFO. This test guards that property.
+        """
+        # First contention period.
+        tc.acquire_task('archive')
+        try:
+            with caplog.at_level('INFO', logger='services.task_coordinator'):
+                tc.acquire_task('indexer')  # INFO log
+                tc.acquire_task('indexer')  # throttled to DEBUG
+        finally:
+            tc.release_task('archive')
+
+        caplog.clear()
+
+        # Lock is now free → next acquire does NOT clear the throttle
+        # map (post-#172). But the second contention's blocker is
+        # different, so the (indexer, cloud_sync) pair has no entry
+        # and still fires INFO.
+        assert tc.acquire_task('cloud_sync') is True
+        try:
+            with caplog.at_level('INFO', logger='services.task_coordinator'):
+                # Second contention period: indexer's first skip vs
+                # the new blocker should fire at INFO.
+                assert tc.acquire_task('indexer') is False
+
+            info_skips = [
+                r for r in caplog.records
+                if r.levelname == 'INFO' and 'skipped' in r.message
+            ]
+            assert len(info_skips) == 1
+            assert "'cloud_sync' is running" in info_skips[0].getMessage()
+        finally:
+            tc.release_task('cloud_sync')
+
+    def test_different_blocker_pair_logs_independently(self, caplog):
+        """Throttling is per (task, blocker) pair, not global. If the
+        same task is skipped by two different blockers in succession,
+        both first occurrences should log at INFO."""
+        # We can't actually have two blockers at once, but we can simulate
+        # the throttle map directly.
+        tc._skipped_log_last[('indexer', 'archive')] = 0.0  # warm cache
+
+        tc.acquire_task('archive')
+        try:
+            with caplog.at_level('INFO', logger='services.task_coordinator'):
+                tc.acquire_task('indexer')
+        finally:
+            tc.release_task('archive')
+
+        # New blocker (cloud_sync), same skipped task (indexer).
+        # Issue #172: the throttle map is no longer cleared on
+        # acquire, but ``(indexer, cloud_sync)`` is a brand-new pair
+        # with no entry, so it still fires INFO independently.
+        caplog.clear()
+        tc.acquire_task('cloud_sync')
+        try:
+            with caplog.at_level('INFO', logger='services.task_coordinator'):
+                tc.acquire_task('indexer')
+
+            info_skips = [
+                r for r in caplog.records
+                if r.levelname == 'INFO' and 'skipped' in r.message
+            ]
+            assert len(info_skips) == 1
+            assert "'cloud_sync' is running" in info_skips[0].getMessage()
+        finally:
+            tc.release_task('cloud_sync')
+
+    def test_rapid_interleave_does_not_spam_info(self, caplog):
+        """Issue #172 regression test — production hot path.
+
+        On a backlogged Pi, ``archive`` and ``indexer`` rapidly
+        interleave (each ~0.5 s of work). Pre-#172, every ``archive``
+        re-acquire wiped the throttle map → next ``indexer`` skip
+        re-fired INFO → ~6 lines/min for the same (indexer, archive)
+        pair. After #172, the throttle map persists across acquires
+        and the per-pair 60s window keeps ≤1 INFO per minute.
+        """
+        # Simulate 20 interleaved cycles of (archive acquires, indexer
+        # rebuffed, archive releases, indexer acquires, indexer releases).
+        # All within sub-second wall time, well inside the 60s throttle.
+        with caplog.at_level('INFO', logger='services.task_coordinator'):
+            for _ in range(20):
+                assert tc.acquire_task('archive') is True
+                # Indexer attempts and is rebuffed — this is the
+                # spam path under the old code.
+                assert tc.acquire_task('indexer') is False
+                tc.release_task('archive')
+                # Indexer acquires (would have wiped throttle pre-#172).
+                assert tc.acquire_task('indexer') is True
+                tc.release_task('indexer')
+
+        info_skips = [
+            r for r in caplog.records
+            if r.levelname == 'INFO' and 'skipped' in r.message
+        ]
+        assert len(info_skips) == 1, (
+            f"Expected exactly 1 INFO 'skipped' log across 20 rapid "
+            f"interleaves (per-pair 60s throttle), got "
+            f"{len(info_skips)}: {[r.getMessage() for r in info_skips]}"
+        )
+
+    def test_throttle_entry_persists_across_acquires(self, caplog):
+        """Issue #172 invariant: ``_skipped_log_last`` is no longer
+        wiped on successful acquire. Verify the entry survives a
+        full acquire/release cycle of the blocker."""
+        # Prime the throttle for (indexer, archive).
+        tc.acquire_task('archive')
+        try:
+            with caplog.at_level('INFO', logger='services.task_coordinator'):
+                tc.acquire_task('indexer')  # → INFO + entry written
+        finally:
+            tc.release_task('archive')
+
+        # Pre-#172 this entry would be wiped by the next successful
+        # acquire below. Post-#172 it persists.
+        original_ts = tc._skipped_log_last.get(('indexer', 'archive'))
+        assert original_ts is not None, "Throttle entry should be set"
+
+        # Fully unrelated task acquires + releases.
+        assert tc.acquire_task('cloud_sync') is True
+        tc.release_task('cloud_sync')
+
+        # Indexer also acquires + releases.
+        assert tc.acquire_task('indexer') is True
+        tc.release_task('indexer')
+
+        # The (indexer, archive) entry MUST still be present (the bug
+        # fix). Pre-#172 it would have been cleared by these acquires.
+        retained_ts = tc._skipped_log_last.get(('indexer', 'archive'))
+        assert retained_ts == original_ts, (
+            "Issue #172 regression: throttle entry was wiped on "
+            "successful acquire — log spam will return."
+        )
+
+
+class TestAcquireReleaseLogLevels:
+    """Phase 1, item 1.2 — May 11 crash forensics fix.
+
+    The pre-fix code emitted INFO on every acquire AND every release
+    (~2 lines/sec under normal indexer load), bloating the journal so
+    badly that ``journalctl`` queries took 90 s during the crash
+    investigation. Routine acquire/release must now log at DEBUG.
+    The user-visible activity signal is the rolling 60 s summary
+    emitted by ``_record_release_stats`` (covered in TestRollingSummary).
+    """
+
+    def test_acquire_does_not_emit_info(self, caplog):
+        with caplog.at_level('DEBUG', logger='services.task_coordinator'):
+            tc.acquire_task('indexer')
+            tc.release_task('indexer')
+        info_msgs = [
+            r for r in caplog.records
+            if r.levelname == 'INFO'
+            and 'acquired lock' in r.getMessage()
+        ]
+        assert info_msgs == [], (
+            "Routine acquire must log at DEBUG (Phase 1 item 1.2 — "
+            "the May 11 forensics showed ~2 INFO lines/sec from this "
+            "path during normal indexer operation)."
+        )
+
+    def test_release_does_not_emit_info(self, caplog):
+        with caplog.at_level('DEBUG', logger='services.task_coordinator'):
+            tc.acquire_task('indexer')
+            tc.release_task('indexer')
+        info_msgs = [
+            r for r in caplog.records
+            if r.levelname == 'INFO'
+            and 'released lock' in r.getMessage()
+        ]
+        assert info_msgs == [], (
+            "Routine release must log at DEBUG (Phase 1 item 1.2)."
+        )
+
+    def test_acquire_release_still_visible_at_debug(self, caplog):
+        with caplog.at_level('DEBUG', logger='services.task_coordinator'):
+            tc.acquire_task('indexer')
+            tc.release_task('indexer')
+        debug_msgs = [
+            r for r in caplog.records
+            if r.levelname == 'DEBUG'
+            and ('acquired lock' in r.getMessage()
+                 or 'released lock' in r.getMessage())
+        ]
+        assert len(debug_msgs) == 2
+
+
+class TestRollingSummary:
+    """Verify the 60 s rolling INFO summary emitted by
+    ``_record_release_stats``. This is the Phase 1 item 1.2 replacement
+    for the per-cycle acquire/release INFO logs.
+    """
+
+    def test_summary_does_not_fire_within_window(self, caplog):
+        with caplog.at_level('INFO', logger='services.task_coordinator'):
+            tc.acquire_task('indexer')
+            tc.release_task('indexer')
+            tc.acquire_task('indexer')
+            tc.release_task('indexer')
+        summary = [
+            r for r in caplog.records
+            if r.levelname == 'INFO' and 'summary' in r.getMessage()
+        ]
+        assert summary == [], (
+            "Summary fired before the 60 s window elapsed."
+        )
+
+    def test_summary_fires_after_window_elapses(self, caplog, monkeypatch):
+        monkeypatch.setattr(tc, '_SUMMARY_INTERVAL_SECONDS', 0.0)
+        with caplog.at_level('INFO', logger='services.task_coordinator'):
+            tc.acquire_task('indexer')
+            tc.release_task('indexer')
+            tc.acquire_task('indexer')
+            tc.release_task('indexer')
+        summary = [
+            r for r in caplog.records
+            if r.levelname == 'INFO' and 'summary' in r.getMessage()
+        ]
+        assert len(summary) >= 1, (
+            "Summary did not fire after window elapsed."
+        )
+        msg = summary[-1].getMessage()
+        assert "'indexer'" in msg
+        assert 'acquire(s)' in msg
+        assert 'avg hold' in msg
+        assert 'max hold' in msg
+
+    def test_summary_resets_after_emit(self, monkeypatch):
+        monkeypatch.setattr(tc, '_SUMMARY_INTERVAL_SECONDS', 0.0)
+        for _ in range(3):
+            tc.acquire_task('indexer')
+            tc.release_task('indexer')
+        assert tc._task_stats['indexer']['acquires'] == 0
+        assert tc._task_stats['indexer']['total_hold'] == 0.0
+        assert tc._task_stats['indexer']['max_hold'] == 0.0
+
+    def test_summary_tracks_per_task_independently(self, monkeypatch):
+        monkeypatch.setattr(tc, '_SUMMARY_INTERVAL_SECONDS', 999.0)
+        tc.acquire_task('indexer')
+        tc.release_task('indexer')
+        tc.acquire_task('archive')
+        tc.release_task('archive')
+        tc.acquire_task('indexer')
+        tc.release_task('indexer')
+        assert tc._task_stats['indexer']['acquires'] == 2
+        assert tc._task_stats['archive']['acquires'] == 1
+
+
+class TestWatchdogNearMissSummary:
+    """Issue #104 mitigation C: when ``max_hold`` for a summary window
+    crosses :data:`WATCHDOG_NEAR_MISS_THRESHOLD_SECONDS` (60 s — well
+    under the BCM2835 hardware watchdog's 90 s timeout), the summary
+    is logged at WARNING and tagged so the precursor signal to the
+    SDIO-contention crash mode is visible at default journalctl
+    verbosity (no ``-p debug`` required).
+    """
+
+    def test_summary_below_threshold_stays_info(
+        self, caplog, monkeypatch,
+    ):
+        monkeypatch.setattr(tc, '_SUMMARY_INTERVAL_SECONDS', 0.0)
+        # Forge a small hold by injecting into _task_stats directly,
+        # then trigger the emit via _record_release_stats. The hold
+        # we pass (0.5s) is well below 60s, so the level must stay INFO.
+        with caplog.at_level('DEBUG', logger='services.task_coordinator'):
+            with tc._lock:
+                tc._record_release_stats('indexer', 0.5)
+        records = [
+            r for r in caplog.records
+            if 'summary' in r.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].levelname == 'INFO'
+        assert 'NEAR-MISS' not in records[0].getMessage()
+
+    def test_summary_at_or_above_threshold_logs_warning_with_tag(
+        self, caplog, monkeypatch,
+    ):
+        monkeypatch.setattr(tc, '_SUMMARY_INTERVAL_SECONDS', 0.0)
+        with caplog.at_level('DEBUG', logger='services.task_coordinator'):
+            with tc._lock:
+                # 75s > 60s threshold → WARNING + tag.
+                tc._record_release_stats('archive', 75.0)
+        records = [
+            r for r in caplog.records
+            if 'summary' in r.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].levelname == 'WARNING'
+        msg = records[0].getMessage()
+        assert 'NEAR-MISS hardware watchdog threshold' in msg
+        assert "'archive'" in msg
+        assert '75.00' in msg
+
+    def test_threshold_boundary_inclusive(self, caplog, monkeypatch):
+        # max_hold == threshold (60.0) MUST trigger WARNING (>= check).
+        # If this regresses to a strict > comparison, the boundary
+        # case becomes silent and we miss precursor signals at
+        # exactly the documented threshold.
+        monkeypatch.setattr(tc, '_SUMMARY_INTERVAL_SECONDS', 0.0)
+        with caplog.at_level('DEBUG', logger='services.task_coordinator'):
+            with tc._lock:
+                tc._record_release_stats(
+                    'indexer', tc.WATCHDOG_NEAR_MISS_THRESHOLD_SECONDS,
+                )
+        records = [
+            r for r in caplog.records
+            if 'summary' in r.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].levelname == 'WARNING'
+
+    def test_max_hold_carries_through_window(self, caplog, monkeypatch):
+        # A single long hold within a window where most others are
+        # short must still raise the level to WARNING — the threshold
+        # is a NEAR-MISS detector, not an average-load detector.
+        monkeypatch.setattr(tc, '_SUMMARY_INTERVAL_SECONDS', 999.0)
+        with tc._lock:
+            tc._record_release_stats('archive', 0.1)
+            tc._record_release_stats('archive', 90.0)  # the spike
+            tc._record_release_stats('archive', 0.1)
+        # Now flip the interval to 0 so the next call emits.
+        monkeypatch.setattr(tc, '_SUMMARY_INTERVAL_SECONDS', 0.0)
+        with caplog.at_level('DEBUG', logger='services.task_coordinator'):
+            with tc._lock:
+                tc._record_release_stats('archive', 0.1)
+        records = [
+            r for r in caplog.records
+            if 'summary' in r.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].levelname == 'WARNING'
+        assert 'NEAR-MISS' in records[0].getMessage()

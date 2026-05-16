@@ -47,6 +47,16 @@ _STOP_JOIN_TIMEOUT = 10.0
 # a directory again after a mount cycle.
 _RESTART_MOUNT_WAIT = 30.0
 
+# Issue #214: minimum wall-clock interval between VFS slab-cache
+# evictions triggered by the file_watcher's internal scans.
+# ``_refresh_ro_mount`` calls ``echo 2 > /proc/sys/vm/drop_caches`` which
+# is process-global; back-to-back invocations on every inotify event
+# burst would generate unnecessary SDIO traffic on the Pi Zero 2 W
+# (re-fetching dentries for ALL mounts, not just the gadget RO mount).
+# 60 s matches ``archive_producer``'s default rescan interval and is
+# well inside Tesla's ~60-min RecentClips rotation window.
+_RO_CACHE_MIN_REFRESH_INTERVAL_S = 60.0
+
 # ---------------------------------------------------------------------------
 # inotify constants (Linux). Defined here so the module imports cleanly on
 # non-Linux dev hosts where ``ctypes.util.find_library('c')`` is missing.
@@ -87,6 +97,7 @@ _status = {
 _on_new_file_callbacks: List[Callable] = []
 _on_deleted_file_callbacks: List[Callable] = []
 _on_event_json_callbacks: List[Callable] = []
+_on_archive_callbacks: List[Callable] = []
 
 
 def register_callback(callback: Callable):
@@ -117,6 +128,24 @@ def register_event_json_callback(callback: Callable):
     without being coupled to the indexing path.
     """
     _on_event_json_callbacks.append(callback)
+
+
+def register_archive_callback(callback: Callable):
+    """Register a callback for the new ``archive_queue`` producer (issue #76).
+
+    Callback signature: callback(file_paths: List[str])
+    Fired with the same path list as the existing mp4 callbacks
+    (:func:`register_callback`) so the archive producer enqueues every
+    clip the indexer enqueues, in the same call. Separate registration
+    keeps the two subsystems independently observable; the archive
+    producer is unconditional (issue #184 Wave 1) so a callback is
+    always registered when the producer module imports.
+
+    Phase 2a producer-only — see :mod:`services.archive_queue` and
+    :mod:`services.archive_producer`. The Phase 2b worker will drain
+    rows enqueued by these callbacks.
+    """
+    _on_archive_callbacks.append(callback)
 
 
 def get_watcher_status() -> dict:
@@ -226,8 +255,99 @@ def restart_watcher(watch_paths: List[str],
     return start_watcher(watch_paths)
 
 
+def _classify_paths(paths: List[str]):
+    """Split a batch into (archive_paths, indexing_paths, dropped_paths).
+
+    Phase 2b dispatch routing (issue #76):
+
+    * Files under the RO USB mount (``/mnt/gadget/part1-ro/...`` or
+      whatever ``MNT_DIR``/``-ro`` resolves to in the running app)
+      flow ONLY into the archive callbacks. The archive worker will
+      copy them to ArchivedClips and from there the archived paths
+      enter the indexing_queue. Routing the RO-mount path directly
+      into indexing_queue would re-introduce the indexer's old habit
+      of parsing files out from under Tesla's RecentClips circular
+      buffer.
+    * Files under ``ARCHIVE_DIR`` (typically ``~/ArchivedClips``)
+      flow ONLY into the indexing callbacks. Anything that lands
+      there has already been archived (by the worker, by a manual
+      scp, or by a future operator action) and needs to be indexed.
+    * Anything outside both prefixes is logged once and dropped —
+      the watcher should not be subscribed to such directories in
+      the first place; if it is, surfacing it via debug log makes
+      the misconfiguration easy to spot.
+
+    The classification is done at the dispatch layer (here) rather
+    than inside each subscriber so the rule is local and reviewable
+    in one spot. Subscribers stay simple (``def cb(paths): ...``)
+    and don't need to know about path topology.
+    """
+    archive_paths: List[str] = []
+    indexing_paths: List[str] = []
+    dropped: List[str] = []
+    ro_prefixes = _ro_mount_prefixes()
+    archive_prefix = _archive_dir_prefix()
+    for p in paths:
+        if not p:
+            continue
+        norm = os.path.normpath(p)
+        # Archive prefix wins if both happen to overlap (defensive —
+        # they shouldn't in any real config).
+        if archive_prefix and (
+            norm == archive_prefix or norm.startswith(archive_prefix + os.sep)
+        ):
+            indexing_paths.append(p)
+            continue
+        if any(
+            norm == pre or norm.startswith(pre + os.sep)
+            for pre in ro_prefixes
+        ):
+            archive_paths.append(p)
+            continue
+        dropped.append(p)
+    return archive_paths, indexing_paths, dropped
+
+
+def _ro_mount_prefixes() -> List[str]:
+    """Return absolute, normalized prefixes for the RO USB mount(s).
+
+    Looked up at call time so a config reload (or tests that set
+    ``MNT_DIR``) takes effect without an import-time cache. Falls back
+    to the canonical path if config can't be imported.
+    """
+    candidates: List[str] = []
+    try:
+        from config import MNT_DIR
+        # Both the historical layout (``<MNT_DIR>/part1-ro``) and the
+        # newer convention (``<MNT_DIR>/part1`` — same path in present
+        # mode where part1 is read-only) are accepted.
+        candidates.append(os.path.normpath(os.path.join(MNT_DIR, 'part1-ro')))
+        candidates.append(os.path.normpath(os.path.join(MNT_DIR, 'part1')))
+    except Exception:  # noqa: BLE001
+        candidates.append(os.path.normpath('/mnt/gadget/part1-ro'))
+        candidates.append(os.path.normpath('/mnt/gadget/part1'))
+    return candidates
+
+
+def _archive_dir_prefix() -> Optional[str]:
+    """Return the absolute, normalized ARCHIVE_DIR prefix, or None."""
+    try:
+        from config import ARCHIVE_DIR
+        return os.path.normpath(ARCHIVE_DIR) if ARCHIVE_DIR else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _notify_callbacks(new_files: List[str], my_generation: int):
-    """Notify all registered new-file callbacks if our generation is current."""
+    """Notify registered callbacks, classifying paths by source.
+
+    Phase 2b routing rule (issue #76, see :func:`_classify_paths`):
+    a path under the RO USB mount fires ONLY the archive callbacks;
+    a path under ``ARCHIVE_DIR`` fires ONLY the indexing callbacks.
+    The two lists are now mutually exclusive — a single mp4 never
+    enters both queues directly. The archive worker bridges the two
+    by enqueuing copied paths into the indexing_queue itself.
+    """
     if not new_files:
         return
     if my_generation != _watcher_generation:
@@ -236,12 +356,26 @@ def _notify_callbacks(new_files: List[str], my_generation: int):
         logger.debug("Dropping %d new-file callbacks (stale generation)",
                      len(new_files))
         return
-    _status["files_detected"] += len(new_files)
-    for cb in _on_new_file_callbacks:
-        try:
-            cb(new_files)
-        except Exception as e:
-            logger.error("Watcher new-file callback error: %s", e)
+
+    archive_paths, indexing_paths, dropped = _classify_paths(new_files)
+    if dropped:
+        logger.debug(
+            "Watcher: %d files dropped — outside RO mount and ArchivedClips: %s",
+            len(dropped), dropped[:3],
+        )
+    _status["files_detected"] += len(archive_paths) + len(indexing_paths)
+    if indexing_paths:
+        for cb in _on_new_file_callbacks:
+            try:
+                cb(indexing_paths)
+            except Exception as e:
+                logger.error("Watcher new-file callback error: %s", e)
+    if archive_paths:
+        for cb in _on_archive_callbacks:
+            try:
+                cb(archive_paths)
+            except Exception as e:
+                logger.error("Watcher archive callback error: %s", e)
 
 
 def _notify_delete_callbacks(deleted_files: List[str], my_generation: int):
@@ -282,6 +416,68 @@ def _notify_event_json_callbacks(paths: List[str], my_generation: int):
             cb(paths)
         except Exception as e:
             logger.error("Watcher event.json callback error: %s", e)
+
+
+def _maybe_refresh_ro_cache(
+    paths: List[str], last_refresh_monotonic: float,
+    min_interval: Optional[float] = None,
+) -> float:
+    """Issue #214: rate-limited VFS slab-cache invalidation.
+
+    Tesla writes to the gadget-backed disk image via the USB
+    ``g_mass_storage`` block layer, which bypasses Linux's VFS layer
+    entirely. The Pi's RO mount of the same image goes through VFS,
+    which caches FAT directory entries (dentries) and inodes in slab
+    caches. Without explicit invalidation, ``readdir`` on the RO
+    mount can return a frozen snapshot for tens of minutes when
+    nothing else triggers a refresh — long enough to exceed Tesla's
+    ~60-min RecentClips rotation window and lose footage.
+
+    :func:`mapping_service._refresh_ro_mount` evicts only the slab
+    cache (``echo 2 > /proc/sys/vm/drop_caches``) — sub-10 ms, no
+    mount/loop/image disruption, and internally non-fatal. Because
+    the eviction is process-global, callers that may invoke this on
+    a high-frequency code path (e.g. the inotify event loop, which
+    iterates per event burst) MUST rate-limit the call.
+
+    ``min_interval`` defaults to ``_RO_CACHE_MIN_REFRESH_INTERVAL_S``
+    looked up at call time (NOT bound at function-definition time)
+    so tests can monkeypatch the module-level constant.
+
+    Returns the wall-clock time (``time.monotonic()``) that should be
+    fed back as ``last_refresh_monotonic`` on the next call. Bumps
+    the timestamp even on failure so a broken sudoers entry can't
+    spam the logs every iteration.
+    """
+    if min_interval is None:
+        min_interval = _RO_CACHE_MIN_REFRESH_INTERVAL_S
+    now = time.monotonic()
+    if now - last_refresh_monotonic < min_interval:
+        return last_refresh_monotonic
+
+    try:
+        # Lazy import: keeps this module's start-up footprint cheap
+        # and avoids any chance of an import cycle through
+        # services.mapping_service.
+        from services.mapping_service import _refresh_ro_mount
+        if paths:
+            # ``drop_caches`` is process-global, so one call invalidates
+            # the slab cache for every mount. Pass the first watched
+            # path purely for caller-intent documentation in the
+            # underlying log line.
+            _refresh_ro_mount(paths[0])
+    except Exception as e:  # noqa: BLE001
+        # Defense in depth: ``_refresh_ro_mount`` already swallows its
+        # own subprocess failures, so this branch only fires for
+        # genuinely catastrophic failures (missing module). Either
+        # way, the watcher must keep running — losing 60 s of
+        # responsiveness is infinitely better than losing the entire
+        # discovery thread.
+        logger.warning(
+            "file_watcher_service: VFS cache refresh skipped "
+            "(non-fatal): %s", e,
+        )
+    return now
 
 
 def _scan_for_new_files(paths: List[str], known_files: Set[str]) -> List[str]:
@@ -456,6 +652,16 @@ def _try_inotify(paths: List[str], known_files: Set[str],
         import select as sel
         buf_size = 4096
 
+        # Issue #214: rate-limited VFS slab-cache invalidation. Tesla's
+        # gadget-block-layer writes never fire inotify events, so the
+        # periodic scan below is the catch-all that surfaces them — but
+        # only if the dentry cache is fresh. Bootstrap at 0.0 so the
+        # first iteration always invalidates; subsequent iterations
+        # honour ``_RO_CACHE_MIN_REFRESH_INTERVAL_S`` (60 s) so an event
+        # burst that triggers many loop iterations per second doesn't
+        # generate a global slab evict on every one.
+        last_refresh_monotonic = 0.0
+
         try:
             while not _watcher_stop.is_set():
                 # Wait up to 30 seconds for events, then do a periodic scan
@@ -547,6 +753,14 @@ def _try_inotify(paths: List[str], known_files: Set[str],
                         event_json_arrivals, my_generation,
                     )
 
+                # Issue #214: refresh VFS dentry cache before the
+                # periodic scan so Tesla's gadget-block-layer writes
+                # become visible to ``readdir``. Rate-limited helper
+                # collapses to a no-op on event-burst iterations.
+                last_refresh_monotonic = _maybe_refresh_ro_cache(
+                    paths, last_refresh_monotonic,
+                )
+
                 # Periodic scan (catches files inotify missed and new subdirs)
                 new_files = _scan_for_new_files(paths, known_files)
                 if new_files:
@@ -610,10 +824,32 @@ def _watcher_loop(my_generation: int):
     _status["mode"] = "polling"
     logger.info("Falling back to polling mode (every %ds)", _POLL_INTERVAL_SECONDS)
 
+    # Issue #214: bootstrap the refresh timestamp at 0.0 so the first
+    # polling tick always invokes the refresh helper (now - 0.0 is well
+    # above _RO_CACHE_MIN_REFRESH_INTERVAL_S). Subsequent ticks honour
+    # the rate limit.
+    last_refresh_monotonic = 0.0
+
     while not _watcher_stop.is_set():
         _watcher_stop.wait(_POLL_INTERVAL_SECONDS)
         if _watcher_stop.is_set():
             break
+
+        # Issue #214 — VFS cache invalidation: when inotify is
+        # unavailable we are the only mechanism that detects Tesla's
+        # gadget-block-layer writes on the RO USB mount. inotify
+        # itself doesn't fire for those writes (they bypass VFS), and
+        # Linux's dentry cache can stay stale for tens of minutes
+        # absent memory pressure. Without this refresh, ``os.scandir``
+        # below returns a frozen snapshot and clips are lost when
+        # Tesla's RecentClips circular buffer (~60 min) rotates them
+        # out before we ever see them. The 5-min polling cadence is
+        # well above the rate-limit floor so the gate always passes
+        # here, but routing through the shared helper keeps the
+        # behaviour symmetric with the inotify path.
+        last_refresh_monotonic = _maybe_refresh_ro_cache(
+            paths, last_refresh_monotonic,
+        )
 
         new_files = _scan_for_new_files(paths, known_files)
         if new_files:

@@ -22,6 +22,59 @@
     }
     #map { width: 100%; height: 100%; z-index: 1; }
 
+    /* ── Top progress bar (active during day-load fetches) ──
+       Sits flush with the top of the map container. Hidden by
+       default; .is-loading on .map-container reveals it. The
+       indeterminate animation is a single CSS keyframe — no JS
+       per-frame work — so it stays smooth even while renderDay()
+       is busy laying down ~2k Leaflet polyline points.
+       A 150 ms reveal delay (handled in JS) keeps the bar from
+       flashing on instant loads. */
+    .map-loading-bar {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        z-index: 1100;
+        pointer-events: none;
+        background: transparent;
+        opacity: 0;
+        transition: opacity 120ms ease-out;
+    }
+    .map-loading-bar > .map-loading-bar-fill {
+        position: absolute;
+        top: 0;
+        left: 0;
+        height: 100%;
+        width: 30%;
+        background: linear-gradient(
+            90deg,
+            transparent 0%,
+            var(--ds-accent-primary, #3B82F6) 20%,
+            var(--ds-accent-primary, #3B82F6) 80%,
+            transparent 100%
+        );
+        animation: map-loading-bar-slide 1.1s linear infinite;
+    }
+    .map-container.is-loading .map-loading-bar {
+        opacity: 1;
+    }
+    .map-container.is-loading .trip-card-stats {
+        opacity: 0.55;
+    }
+    @keyframes map-loading-bar-slide {
+        0%   { transform: translateX(-100%); }
+        100% { transform: translateX(400%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .map-loading-bar > .map-loading-bar-fill {
+            animation: none;
+            width: 100%;
+            opacity: 0.7;
+        }
+    }
+
     /* ── Trip Card (bottom-left floating) ── */
     .trip-card {
         position: absolute;
@@ -80,6 +133,7 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+        transition: opacity 120ms ease-out;
     }
     .trip-card-indexed {
         font-size: 0.6875rem;
@@ -770,6 +824,15 @@
     <!-- Map -->
     <div id="map"></div>
 
+    <!-- Day-load progress bar (hidden until .map-container.is-loading) -->
+    <div class="map-loading-bar" id="mapLoadingBar"
+         role="progressbar"
+         aria-label="Loading map data"
+         aria-busy="false"
+         aria-hidden="true">
+        <div class="map-loading-bar-fill"></div>
+    </div>
+
     <!-- Event-Type Filter Pills (top-center, populated dynamically per day) -->
     <div class="event-filter-pills" id="eventFilterPills" role="toolbar" aria-label="Filter event markers"></div>
 
@@ -1000,12 +1063,89 @@ let dayLoadSeq = 0;
 let tripSelectSeq = 0;
 let showingAllTime = false;
 
+// ── Day-load progress indicator ──
+// Cheap nestable counter: callers wrap each in-flight load in a
+// beginMapLoading() / endMapLoading() pair. The map-container's
+// .is-loading class drops only when the counter reaches zero, so
+// overlapping fetches (e.g. an All-time render kicking off while
+// a prior loadDay() is still in-flight) keep the bar visible
+// without flicker. A 150 ms reveal delay hides the bar entirely
+// for instant loads (cached, sub-second), so the user only ever
+// sees it when there's actually something to wait for.
+let mapLoadingDepth = 0;
+let mapLoadingRevealTimer = null;
+
+function beginMapLoading() {
+    mapLoadingDepth += 1;
+    if (mapLoadingDepth !== 1) return;
+    if (mapLoadingRevealTimer) {
+        clearTimeout(mapLoadingRevealTimer);
+    }
+    mapLoadingRevealTimer = setTimeout(function () {
+        mapLoadingRevealTimer = null;
+        if (mapLoadingDepth <= 0) return;
+        const container = document.querySelector('.map-container');
+        const bar = document.getElementById('mapLoadingBar');
+        if (container) container.classList.add('is-loading');
+        if (bar) {
+            bar.setAttribute('aria-busy', 'true');
+            bar.setAttribute('aria-hidden', 'false');
+        }
+    }, 150);
+    disableDayNav();
+}
+
+function endMapLoading() {
+    mapLoadingDepth = Math.max(0, mapLoadingDepth - 1);
+    if (mapLoadingDepth !== 0) return;
+    if (mapLoadingRevealTimer) {
+        clearTimeout(mapLoadingRevealTimer);
+        mapLoadingRevealTimer = null;
+    }
+    const container = document.querySelector('.map-container');
+    const bar = document.getElementById('mapLoadingBar');
+    if (container) container.classList.remove('is-loading');
+    if (bar) {
+        bar.setAttribute('aria-busy', 'false');
+        bar.setAttribute('aria-hidden', 'true');
+    }
+    // Re-enable of the nav buttons is the responsibility of renderDayCard()
+    // / renderAllTimeCard() — those callers know the new view's edge-state
+    // (e.g. next stays disabled on the most-recent day). Calling them is
+    // the only correct way to restore the buttons.
+}
+
+function disableDayNav() {
+    // Disable the prev/next/all buttons during in-flight loads so
+    // the user can't queue a chain of clicks that race the seq guard.
+    // The corresponding re-enable happens in renderDayCard() /
+    // renderAllTimeCard() once the load completes — those functions
+    // set the correct enabled state for the new view.
+    const prevBtn = document.getElementById('dayPrev');
+    const nextBtn = document.getElementById('dayNext');
+    const allBtn = document.getElementById('dayAllBtn');
+    if (prevBtn) prevBtn.disabled = true;
+    if (nextBtn) nextBtn.disabled = true;
+    if (allBtn) allBtn.disabled = true;
+}
+
 // All-time trips snapshot. Populated by renderAllTime() once the
 // race-guard passes; cleared whenever we leave All time. The
 // disambiguation popup needs this to find candidate trips near a
 // click without re-fetching, and the lifecycle is tied to the
 // rendered All time layers — never let it outlive them.
 let allTimeTrips = [];
+
+// Per-day playability snapshot for the disambiguation chooser.
+// Shape: { date: 'YYYY-MM-DD', trips: { <trip_id>: <bool> } }.
+// Populated by loadPlayableTripsForCurrentDay() after each loadDay()
+// fetch lands. Read by filterPlayableCandidates() to drop ghost trips
+// (waypoints reference video files Tesla has overwritten) before the
+// disambiguation popup is built (issue #77). Null until the first
+// load completes — filtering fails-open in that window so a slow
+// network never hides real trips. Cleared whenever we leave the
+// per-day view so stale state can't bleed into a subsequent day.
+let playableTripsForDay = null;
 
 // Highlight overlay used by the disambiguation popup to flash a
 // candidate trip's polyline on row hover. Drawn into a dedicated
@@ -1212,6 +1352,78 @@ function pickPlayableWaypointForTrip(trip, clickLatLng) {
     return best;
 }
 
+function filterPlayableCandidates(candidates) {
+    // Drop candidates whose trip is a "ghost" — its waypoints'
+    // video_path values still point at clips Tesla has overwritten,
+    // so the disambiguation popup would offer them and the user's
+    // pick would yield a "No video available" toast. The server's
+    // /api/trips/playable endpoint authoritatively answers this via
+    // os.path.isfile() on the canonical paths (issue #77).
+    //
+    // Fail-open: if the playability snapshot hasn't arrived yet
+    // (slow network, fetch errored, or All time view), pass the
+    // candidate list through unchanged so we never hide a real trip
+    // because of a metadata fetch hiccup. Worst case: the user sees
+    // the same toast they would have seen pre-fix.
+    if (!candidates || !candidates.length) return candidates || [];
+    if (!playableTripsForDay
+        || playableTripsForDay.date !== currentDate
+        || !playableTripsForDay.trips) {
+        return candidates;
+    }
+    const known = playableTripsForDay.trips;
+    const filtered = [];
+    for (const c of candidates) {
+        const tid = c && c.trip && c.trip.trip_id;
+        if (tid == null) {
+            // Trip without an id (defensive) — keep it; we have no
+            // basis to filter.
+            filtered.push(c);
+            continue;
+        }
+        // The server JSON-stringifies trip ids (object keys must be
+        // strings). Look up by string form; treat unknown trips as
+        // playable to avoid hiding any trip the snapshot missed.
+        const entry = known[String(tid)];
+        if (entry === false) continue;
+        filtered.push(c);
+    }
+    return filtered;
+}
+
+async function loadPlayableTripsForCurrentDay(date, seq) {
+    // Fetch /api/trips/playable for ``date`` and stash the result in
+    // playableTripsForDay so the disambiguation chooser can hide
+    // ghost trips (issue #77). Race-guarded against rapid day
+    // navigation: the caller passes the same dayLoadSeq token used
+    // by loadDay(), and we only commit if it's still current.
+    //
+    // The endpoint is cached server-side for 60 s, so repeated
+    // navigation back to the same day is essentially free.
+    if (!date) return;
+    let data;
+    try {
+        const resp = await fetch(
+            `/api/trips/playable?date=${encodeURIComponent(date)}`,
+        );
+        if (!resp.ok) {
+            // Non-200 (e.g. 503 when image is missing or 400 on bad
+            // date) — leave snapshot null so filtering fails-open.
+            return;
+        }
+        data = await resp.json();
+    } catch (e) {
+        // Network error — same fail-open behavior.
+        console.warn('Failed to load playable-trips snapshot:', e);
+        return;
+    }
+    if (seq !== dayLoadSeq || date !== currentDate) return;
+    if (data && data.date === date && data.trips
+            && typeof data.trips === 'object') {
+        playableTripsForDay = { date: date, trips: data.trips };
+    }
+}
+
 function highlightCandidateTrip(trip) {
     // Draw a fresh thick polyline on a dedicated layer for the
     // candidate. Doesn't touch any existing trip layers, so we
@@ -1347,7 +1559,7 @@ function showDisambigPopup(latlng, candidates) {
         }
         const screenPt = map.latLngToContainerPoint(latlng);
         closeDisambigPopup();
-        openVideoOverlay(seed, screenPt, trip.waypoints || []);
+        openVideoOverlay(seed, screenPt, trip.waypoints || [], trip.trip_id);
     };
 
     for (const c of candidates) {
@@ -1544,6 +1756,10 @@ async function loadDay(date, options) {
     // and the All time waypoints would be stale anyway after a
     // re-render.
     allTimeTrips = [];
+    // Drop the previous day's playability snapshot so a stale
+    // entry can never filter out a real trip on the new day.
+    // loadPlayableTripsForCurrentDay() repopulates this below.
+    playableTripsForDay = null;
     showingAllTime = false;
     currentDate = date;
     writeUrlState({ date: date }, {
@@ -1561,6 +1777,7 @@ async function loadDay(date, options) {
     fsdLayer.clearLayers();
     eventCluster.clearLayers();
 
+    beginMapLoading();
     try {
         // No date-scoped event cap: a busy sentry day can have
         // hundreds of events and silently truncating would hide
@@ -1579,6 +1796,12 @@ async function loadDay(date, options) {
         currentDayData = routesData && routesData.trips ? routesData : { trips: [] };
         allEvents = eventsData.events || [];
         rebuildEventFilterPills();
+        // Kick off the playability snapshot in parallel with
+        // renderDay() — the disambiguation popup only needs it on
+        // user click, and renderDay() doesn't depend on it. A late
+        // arrival is fine; filterPlayableCandidates() fails-open
+        // until the snapshot lands. Race-guarded by ``seq``.
+        loadPlayableTripsForCurrentDay(date, seq);
         await renderDay();
     } catch (e) {
         console.error('Failed to load day routes/events:', e);
@@ -1590,6 +1813,15 @@ async function loadDay(date, options) {
         rebuildEventFilterPills();
         if (typeof showToast === 'function') {
             showToast('Could not load this day. Try again.', 'warning');
+        }
+    } finally {
+        endMapLoading();
+        // Only re-render the day card if we're still the active load
+        // — a stale finally must not re-enable nav buttons that a
+        // newer in-flight loadDay() has intentionally disabled. The
+        // active load will run its own renderDayCard() when it lands.
+        if (seq === dayLoadSeq && date === currentDate) {
+            renderDayCard();
         }
     }
 }
@@ -2034,19 +2266,42 @@ function renderTripOnDay(trip, bounds) {
             // picks whichever trip's clickTarget happens to be on top
             // and the user can't choose the drive they wanted.
             const candidates = findCandidatesNearClick(e.latlng);
-            if (candidates.length >= 2) {
-                showDisambigPopup(e.latlng, candidates);
+            // Drop "ghost" trips whose video files no longer exist on
+            // disk so the popup never offers them and the user never
+            // hits a "No video available" toast (issue #77). Filter
+            // fails-open while the playability snapshot is loading.
+            const playableCandidates = filterPlayableCandidates(candidates);
+            if (playableCandidates.length >= 2) {
+                showDisambigPopup(e.latlng, playableCandidates);
                 return;
             }
-            // Single-candidate (or zero) fast path — preserve the
-            // pre-disambiguation behavior of opening the nearest
-            // playable waypoint immediately. Pass the full trip's
-            // valid waypoints (not just this chunk) so the overlay
-            // can navigate the entire trip's video timeline.
-            const trip = (candidates[0] && candidates[0].trip) || { waypoints: valid };
-            const playable = pickPlayableWaypointForTrip(trip, e.latlng);
-            if (playable) {
-                openVideoOverlay(playable, e.containerPoint, trip.waypoints || valid);
+            if (playableCandidates.length === 1) {
+                // Exactly one trip survived the filter — skip the
+                // popup and play directly. Use the original click
+                // latlng (not the candidate's seed) so we pick the
+                // same point the user actually tapped.
+                const trip = playableCandidates[0].trip;
+                const playable = pickPlayableWaypointForTrip(trip, e.latlng);
+                if (playable) {
+                    openVideoOverlay(playable, e.containerPoint, trip.waypoints || valid, trip.trip_id);
+                }
+                return;
+            }
+            // Zero playable candidates. If the spatial search did
+            // find something but every match was a ghost, tell the
+            // user. Otherwise (no spatial match at all) fall through
+            // to the legacy per-chunk fallback — try this trip's
+            // nearest playable waypoint.
+            if (candidates.length > 0) {
+                if (typeof showToast === 'function') {
+                    showToast('No clips available for this location.', 'warning');
+                }
+                return;
+            }
+            const fallbackTrip = { waypoints: valid };
+            const fallbackPlayable = pickPlayableWaypointForTrip(fallbackTrip, e.latlng);
+            if (fallbackPlayable) {
+                openVideoOverlay(fallbackPlayable, e.containerPoint, valid);
             }
         });
     }
@@ -2125,6 +2380,12 @@ async function renderAllTime() {
     // the fetch doesn't search a half-stale trip set, and so a
     // failed load doesn't leave the previous trips searchable.
     allTimeTrips = [];
+    // All-time view doesn't apply the per-day playable-trips filter
+    // (its candidates resolve to a "go to that day" navigation, not
+    // a video open), but clear the snapshot anyway so a click on
+    // an All-time polyline followed by quick navigation back to a
+    // per-day view can't reuse a stale snapshot from a different day.
+    playableTripsForDay = null;
     tripLayer.clearLayers();
     fsdLayer.clearLayers();
     eventCluster.clearLayers();
@@ -2135,6 +2396,7 @@ async function renderAllTime() {
     rebuildEventFilterPills();
 
     let routesData, eventsData;
+    beginMapLoading();
     try {
         const [routesResp, eventsResp] = await Promise.all([
             fetch('/api/all-routes'),
@@ -2144,7 +2406,11 @@ async function renderAllTime() {
         eventsData = await eventsResp.json();
     } catch (e) {
         console.error('Failed to load all-time view:', e);
+        endMapLoading();
+        // Only re-render the all-time card if we're still on All
+        // time — a stale failure must not stomp on a newer load.
         if (seq !== dayLoadSeq || !showingAllTime) return;
+        renderAllTimeCard();
         if (typeof showToast === 'function') {
             showToast('Could not load All time view. Try again.', 'warning');
         }
@@ -2153,7 +2419,10 @@ async function renderAllTime() {
 
     // Race guard: user may have cycled out of All time or started
     // a different load while we were waiting. Apply nothing if so.
-    if (seq !== dayLoadSeq || !showingAllTime) return;
+    if (seq !== dayLoadSeq || !showingAllTime) {
+        endMapLoading();
+        return;
+    }
 
     // Re-clear between fetch start and result land in case an
     // earlier load added layers; guarantees no double-render.
@@ -2246,6 +2515,16 @@ async function renderAllTime() {
     if (bounds.length) {
         map.fitBounds(bounds, { padding: [30, 30] });
     }
+
+    // Bar stays up through the polyline build above; release once the
+    // visible work is done so the user sees the indicator until the
+    // map is actually drawn (not just until the JSON arrived). Then
+    // re-render the all-time card so the nav buttons get re-enabled
+    // (beginMapLoading() disabled them via disableDayNav(); the card
+    // renderer is the one that knows the correct edge-state for the
+    // restored view, so it owns re-enable).
+    endMapLoading();
+    renderAllTimeCard();
 }
 
 // --- Video Player Overlay ---
@@ -2280,12 +2559,47 @@ function getBasePath(videoPath) {
     return angle ? videoPath.replace(`-${angle}.mp4`, '') : videoPath.replace('.mp4', '');
 }
 
-function openVideoOverlay(waypoint, clickPoint, routeWps) {
+function openVideoOverlay(waypoint, clickPoint, routeWps, tripId) {
     closeDisambigPopup();
     closeVideoOverlay();
 
     // Set waypoints AFTER close clears them
     overlayWaypoints = routeWps || [];
+
+    // Issue #184 Wave 3 — Phase D. The map polyline endpoints
+    // (/api/trip/<id>/route, /api/day/<date>/routes) only return
+    // hot columns (lat/lon/speed/heading/autopilot_state) so the
+    // server saves SD page-cache pressure on routine map browsing.
+    // When the overlay opens we lazy-fetch cold telemetry
+    // (steering/brake/accel/gear/blinker) and merge it into the
+    // existing waypoints array so updateOverlayTelemetry() can
+    // read wp.steering_angle / wp.brake_applied / etc. unchanged.
+    // Best-effort: a fetch failure leaves the HUD on neutral
+    // defaults, which already happens for SentryClips/ad-hoc
+    // overlay opens that don't have a trip context.
+    if (tripId && Array.isArray(overlayWaypoints) && overlayWaypoints.length > 0) {
+        const opSeq = ++overlayOpenSeq;
+        fetch(`/api/trip/${encodeURIComponent(tripId)}/telemetry`)
+            .then(r => (r && r.ok) ? r.json() : null)
+            .then(data => {
+                if (!data || !data.telemetry) return;
+                if (opSeq !== overlayOpenSeq) return;
+                const telem = data.telemetry;
+                for (const wp of overlayWaypoints) {
+                    const t = telem[String(wp.id)];
+                    if (!t) continue;
+                    if (wp.acceleration_x === undefined) wp.acceleration_x = t.acceleration_x;
+                    if (wp.acceleration_y === undefined) wp.acceleration_y = t.acceleration_y;
+                    if (wp.acceleration_z === undefined) wp.acceleration_z = t.acceleration_z;
+                    if (wp.gear === undefined) wp.gear = t.gear;
+                    if (wp.steering_angle === undefined) wp.steering_angle = t.steering_angle;
+                    if (wp.brake_applied === undefined) wp.brake_applied = t.brake_applied;
+                    if (wp.blinker_on_left === undefined) wp.blinker_on_left = t.blinker_on_left;
+                    if (wp.blinker_on_right === undefined) wp.blinker_on_right = t.blinker_on_right;
+                }
+            })
+            .catch(() => { /* HUD already falls back to neutral defaults */ });
+    }
 
     const filename = waypoint.video_path.split('/').pop();
     overlayCurrentAngle = CAMERA_ANGLES.find(a => filename.includes('-' + a + '.')) || 'front';
@@ -2369,9 +2683,15 @@ function openVideoOverlay(waypoint, clickPoint, routeWps) {
     const video = document.getElementById('overlayVideo');
     video.src = `/videos/stream/${waypoint.video_path}`;
 
-    // Handle video load error — file may no longer exist on disk
+    // Handle video load error — file may no longer exist on disk.
+    // NOTE: check the raw src ATTRIBUTE, not the .src property. The property
+    // resolves an empty/missing attribute against the document base URL
+    // (e.g. https://host/mapping), which is non-empty and would slip past a
+    // .src-based guard, surfacing a false "video not found" toast when the
+    // overlay is closed or the element is detached mid-load.
     video.addEventListener('error', function onError() {
-        if (!video.src || video.src.endsWith('/')) return;
+        const rawSrc = video.getAttribute('src');
+        if (!rawSrc) return;
         if (typeof showToast === 'function') {
             showToast('Video file not found — Tesla may have overwritten it.', 'warning');
         }
@@ -2432,6 +2752,12 @@ function openVideoOverlay(waypoint, clickPoint, routeWps) {
 // during openVideoOverlay. Reset on each open/close cycle.
 let overlayDragController = null;
 
+// Issue #184 Wave 3 — Phase D. Monotonic sequence tagged on each
+// overlay open. Used by the lazy telemetry fetch to discard a
+// stale response when the user opens a different clip before the
+// fetch returns.
+let overlayOpenSeq = 0;
+
 const LUCIDE_SPRITE = "{{ url_for('static', filename='icons/lucide-sprite.svg') }}";
 const OVERLAY_ICON_MAX = LUCIDE_SPRITE + "#icon-maximize-2";
 const OVERLAY_ICON_MIN = LUCIDE_SPRITE + "#icon-minimize-2";
@@ -2451,15 +2777,114 @@ function overlayFullscreen() {
     // fullscreen — acceptable platform limitation. Use Maximize (the
     // adjacent button) on iOS to get an HUD-visible fill of the
     // browser viewport instead.
+    //
+    // Phase 4.9 (#101): show a one-time toast on first iOS fullscreen
+    // tap so users know the HUD loss is a Safari limitation and that
+    // "Maximize" is the HUD-preserving alternative. Persisted via
+    // localStorage so the user is nagged at most once per browser.
     const stage = document.querySelector('.video-overlay-stage');
     const v = document.getElementById('overlayVideo');
     if (!v) return;
+
+    if (isIos() && !hasShownIosFullscreenToast()) {
+        // Phase 4.9 (#101) — first-tap behaviour on iOS Safari:
+        // SHOW THE TOAST AND SKIP FULLSCREEN. If we entered fullscreen
+        // immediately the toast would be hidden behind the OS player
+        // and the user would never see the explanation. Skipping the
+        // fullscreen on the very first tap is acceptable because the
+        // user's stated intent is "give me a bigger view" and the
+        // toast explicitly recommends Maximize, which delivers that
+        // intent without losing the HUD.
+        //
+        // Subsequent taps (after the localStorage flag is set) proceed
+        // to webkitEnterFullscreen normally for users who deliberately
+        // want OS fullscreen and accept the HUD loss.
+        showIosFullscreenToast();
+        markIosFullscreenToastShown();
+        return;
+    }
+
     if (stage && stage.requestFullscreen) {
         stage.requestFullscreen().catch(() => {});
     } else if (stage && stage.webkitRequestFullscreen) {
         stage.webkitRequestFullscreen();
     } else if (v.webkitEnterFullscreen) {
         v.webkitEnterFullscreen();
+    }
+}
+
+// Phase 4.9 (#101) — iOS Safari detection.
+// iPad on iOS 13+ identifies its UA as "Macintosh" but exposes the
+// touch-event API, so we combine the two signals. Returns true on
+// iPhone, iPad, and iPod across all modern iOS versions.
+// iOS detection: returns true for any iOS browser (iPhone, iPad,
+// iPod, iPad-on-iOS-13+ in desktop-mode masquerade). Apple policy
+// requires every iOS browser to use WebKit, so the toast applies
+// equally to Safari, Chrome, Firefox, etc. on iOS — the function
+// is intentionally named for iOS, not Safari specifically.
+function isIos() {
+    if (typeof navigator === 'undefined') return false;
+    const ua = navigator.userAgent || '';
+    if (/iPhone|iPad|iPod/i.test(ua)) return true;
+    // iPadOS desktop-mode masquerade: Mac UA + touch support.
+    const isMac = /Macintosh/i.test(ua);
+    const hasTouch = (typeof navigator.maxTouchPoints === 'number' &&
+                      navigator.maxTouchPoints > 1);
+    return isMac && hasTouch;
+}
+// Backwards-compatible alias for any external caller (and a more
+// discoverable name from the IDE). Both names point at the same
+// function — never diverge.
+const isIosSafari = isIos;
+
+const IOS_FULLSCREEN_TOAST_KEY = 'iosFullscreenToastShown';
+
+// In-memory fallback flag for browsers where localStorage throws on
+// EVERY access (Safari Private Mode quota=0). Without this the early
+// return in overlayFullscreen() would fire on every tap and the user
+// could never reach webkitEnterFullscreen — softlocking the button
+// despite the toast text saying "tap Fullscreen again to continue."
+// Module-scoped so it survives across taps within the same page load
+// (the only durability we need — Private Mode doesn't persist
+// preferences across reloads anyway).
+let _iosFullscreenToastShownInMemory = false;
+
+function hasShownIosFullscreenToast() {
+    if (_iosFullscreenToastShownInMemory) return true;
+    try {
+        return localStorage.getItem(IOS_FULLSCREEN_TOAST_KEY) === '1';
+    } catch (e) {
+        // Private browsing / disabled storage → fall back to the
+        // in-memory flag (which mark…() also sets), so the second
+        // tap proceeds to fullscreen normally.
+        return false;
+    }
+}
+
+function markIosFullscreenToastShown() {
+    _iosFullscreenToastShownInMemory = true;
+    try {
+        localStorage.setItem(IOS_FULLSCREEN_TOAST_KEY, '1');
+    } catch (e) { /* storage disabled — in-memory flag is enough */ }
+}
+
+// Polite, single-line toast pointing iOS users at the Maximize
+// button. Uses the existing showToast() infra (info severity) so
+// dark/light mode + dismiss timing are inherited. Falls back to a
+// console.log if showToast isn't available — never blocks the
+// fullscreen action.
+function showIosFullscreenToast() {
+    const msg = ('iOS Safari hides the HUD in fullscreen. ' +
+                 'Tap Maximize for an HUD-visible view, ' +
+                 'or tap Fullscreen again to continue without HUD.');
+    if (typeof showToast === 'function') {
+        showToast(msg, 'info');
+    } else {
+        // Defensive — base.html owns showToast. If a future refactor
+        // moves it, surface a developer-visible warning rather than
+        // crashing the fullscreen path.
+        try { console.log('TeslaUSB iOS fullscreen toast:', msg); }
+        catch (e) {}
     }
 }
 
@@ -2640,7 +3065,7 @@ async function openEventVideo(tripId, videoPath, frameOffset, lat, lon) {
     }
 
     // Center the overlay on screen
-    openVideoOverlay(wp, { x: window.innerWidth / 3, y: window.innerHeight / 4 }, wps);
+    openVideoOverlay(wp, { x: window.innerWidth / 3, y: window.innerHeight / 4 }, wps, tripId);
 }
 
 // Event delegation for popup video links (avoids inline onclick XSS risk)
@@ -2678,12 +3103,28 @@ document.addEventListener('click', function(e) {
 });
 
 function closeVideoOverlay() {
+    // Bump the open-sequence counter so any in-flight lazy-load
+    // telemetry fetch (started by openVideoOverlay) discards its
+    // response when it returns. The fetch's own ``opSeq !== overlayOpenSeq``
+    // check below is the single source of truth for "is this response
+    // still relevant?" — keep it that way by always invalidating here,
+    // not by relying on overlayWaypoints being empty (a future change
+    // that re-populates the array after close would silently break).
+    ++overlayOpenSeq;
     const existing = document.getElementById('videoOverlay');
     if (existing) {
         const video = existing.querySelector('video');
         if (video) {
             video.removeEventListener('timeupdate', onOverlayTimeUpdate);
-            video.pause(); video.src = '';
+            video.pause();
+            // Properly abort any pending load. Setting src='' resolves to
+            // the document base URL (e.g. https://host/mapping) and the
+            // browser then tries to load THAT as a video, fails, and fires
+            // a spurious 'error' event that surfaced a false "video file
+            // not found" toast every time the overlay was closed. The HTML5
+            // standard reset is removeAttribute('src') + load().
+            video.removeAttribute('src');
+            video.load();
         }
         existing.remove();
     }

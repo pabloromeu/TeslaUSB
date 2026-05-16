@@ -53,7 +53,11 @@ from blueprints import (
     captive_portal_bp,
     catch_all_redirect,
     cloud_archive_bp,
-    live_events_bp,
+    archive_queue_bp,
+    storage_retention_bp,
+    jobs_bp,
+    system_health_bp,
+    settings_advanced_bp,
 )
 
 app.register_blueprint(mapping_bp)
@@ -71,7 +75,11 @@ app.register_blueprint(cleanup_bp)
 app.register_blueprint(api_bp)
 app.register_blueprint(fsck_bp)
 app.register_blueprint(cloud_archive_bp)
-app.register_blueprint(live_events_bp)
+app.register_blueprint(archive_queue_bp)
+app.register_blueprint(storage_retention_bp)
+app.register_blueprint(jobs_bp)
+app.register_blueprint(system_health_bp)
+app.register_blueprint(settings_advanced_bp)
 # Register captive portal blueprint LAST to avoid conflicting with other routes
 app.register_blueprint(captive_portal_bp)
 
@@ -117,12 +125,26 @@ if __name__ == "__main__":
     print(f"Gadget directory: {GADGET_DIR}")
     print(f"Access the interface at: http://0.0.0.0:{WEB_PORT}/")
 
-    # Start RecentClips archive timer (copies clips to SD card before Tesla deletes them)
+    # Phase 3a.2 (#98): one-shot migration of legacy cleanup_config.json
+    # into the unified ``cleanup`` config.yaml section. Idempotent and
+    # never raises — safe to call on every boot.
     try:
-        from services.video_archive_service import start_archive_timer
-        start_archive_timer()
-    except Exception as e:
-        print(f"Warning: Failed to start archive timer: {e}")
+        from services.cleanup_service import migrate_legacy_cleanup_config
+        migration = migrate_legacy_cleanup_config(GADGET_DIR)
+        if migration.get('migrated'):
+            print(
+                f"cleanup migration: imported {migration['imported_folders']} "
+                f"into config.yaml cleanup.policies"
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: cleanup migration failed (non-fatal): {e}")
+
+    # Phase 2b (issue #76): the legacy ``start_archive_timer`` periodic
+    # thread is gone. The new flow is queue-driven: ``archive_producer``
+    # enqueues into ``archive_queue``, and ``archive_worker`` drains
+    # the queue one file at a time. Both are started below, after the
+    # file watcher is wired so the worker's `wake()` from the producer
+    # callback path lands cleanly.
 
     # Start file watcher for new video detection. The callback enqueues
     # individual paths into the indexing_queue table; the indexing
@@ -130,7 +152,7 @@ if __name__ == "__main__":
     try:
         from services.file_watcher_service import (
             start_watcher, register_callback, register_delete_callback,
-            register_event_json_callback,
+            register_event_json_callback, register_archive_callback,
         )
         watch_paths = []
         # Watch TeslaCam on USB (RO mount)
@@ -149,16 +171,15 @@ if __name__ == "__main__":
             try:
                 from config import MAPPING_ENABLED, MAPPING_DB_PATH
                 if MAPPING_ENABLED:
-                    def _on_new_videos(file_paths):
-                        from services.mapping_service import (
-                            enqueue_many_for_indexing,
-                        )
-                        items = [(p, None) for p in file_paths if p]
-                        if items:
-                            enqueue_many_for_indexing(
-                                MAPPING_DB_PATH, items, source='watcher',
-                            )
-
+                    # Issue #184 Wave 2 — Phase C: the inotify→indexing
+                    # callback that used to live here was a duplicate
+                    # enqueue path. The archive worker (which is the
+                    # only writer to ``ArchivedClips``) calls
+                    # ``_enqueue_indexed`` directly after each
+                    # successful copy, and ``boot_catchup_scan``
+                    # handles anything an operator might rsync into
+                    # ArchivedClips outside the worker. Per-clip
+                    # ``indexing_queue`` INSERTs drop from 2→1.
                     def _on_deleted_videos(file_paths):
                         # Mirror deletes immediately so the map page
                         # doesn't keep showing trips/events for clips
@@ -174,32 +195,95 @@ if __name__ == "__main__":
                         except Exception as e:
                             print(f"Warning: purge_deleted_videos failed: {e}")
 
-                    register_callback(_on_new_videos)
                     register_delete_callback(_on_deleted_videos)
-                    print("File watcher → indexing queue producer registered")
+                    print("File watcher → delete callback registered")
             except Exception as e:
                 print(f"Warning: Failed to register watcher callbacks: {e}")
 
-            # Live Event Sync producer: enqueue Sentry/Saved events the
-            # moment Tesla writes event.json. Independent of the
-            # indexing callback above; both fire from the same inotify
-            # watcher with no extra file descriptors.
+            # Wave 4 PR-F4 (issue #184): live-event upload producer.
+            # Replaces the standalone Live Event Sync subsystem. The
+            # file_watcher fires ``register_event_json_callback`` the
+            # moment Tesla writes a new event.json; we enqueue at
+            # ``PRIORITY_LIVE_EVENT`` into the unified pipeline_queue
+            # so the cloud_archive worker picks it up before any
+            # bulk catch-up rows. Same inotify watcher, no separate
+            # service / queue / worker / config flag.
             try:
-                from config import LIVE_EVENT_SYNC_ENABLED
-                if LIVE_EVENT_SYNC_ENABLED:
-                    def _on_new_event_json(file_paths):
-                        from services.live_event_sync_service import (
-                            enqueue_event_json,
-                        )
-                        try:
-                            enqueue_event_json(list(file_paths))
-                        except Exception as e:
-                            print(f"Warning: LES enqueue failed: {e}")
+                def _on_new_event_json(file_paths):
+                    from services.cloud_archive_service import (
+                        enqueue_live_event_from_event_json,
+                    )
+                    try:
+                        enqueue_live_event_from_event_json(list(file_paths))
+                    except Exception as e:
+                        print(f"Warning: live-event enqueue failed: {e}")
 
-                    register_event_json_callback(_on_new_event_json)
-                    print("File watcher → Live Event Sync producer registered")
+                register_event_json_callback(_on_new_event_json)
+                print("File watcher → cloud live-event producer registered")
             except Exception as e:
-                print(f"Warning: Failed to register LES watcher callback: {e}")
+                print(f"Warning: Failed to register live-event watcher callback: {e}")
+
+            # Archive queue producer (issue #76 Phase 2a): mirror the
+            # mp4 callback into the archive_queue table. Issue #184 Wave 1
+            # made the queue subsystem unconditional — there is no longer
+            # an enable flag.
+            #
+            # Issue #184 Wave 2 — Phase B: the inotify path now calls
+            # ``archive_producer.enqueue_with_peek`` instead of the raw
+            # ``archive_queue.enqueue_many_for_archive`` so RecentClips
+            # candidates with no GPS-bearing SEI are dropped at the
+            # producer (no queue row, no worker pick, no SD writes).
+            try:
+                def _on_new_videos_for_archive(file_paths):
+                    from services.archive_producer import enqueue_with_peek
+                    try:
+                        enqueue_with_peek(list(file_paths))
+                    except Exception as e:
+                        print(
+                            "Warning: archive_queue enqueue failed: "
+                            f"{e}"
+                        )
+
+                register_archive_callback(_on_new_videos_for_archive)
+                print("File watcher → archive_queue producer registered")
+            except Exception as e:
+                print(
+                    "Warning: Failed to register archive_queue watcher "
+                    f"callback: {e}"
+                )
+
+            # Cloud archive worker wake (Phase 3b #99): a freshly
+            # archived mp4 is now visible to the cloud sync queue
+            # producer — poke the continuous worker so the upload
+            # starts on the next iteration instead of waiting for the
+            # next 5-minute idle timeout. The wake is a single
+            # threading.Event.set() so any debouncing is unnecessary
+            # (multiple wakes during a drain are coalesced into one).
+            try:
+                from config import (
+                    CLOUD_ARCHIVE_ENABLED, CLOUD_ARCHIVE_PROVIDER,
+                )
+                if CLOUD_ARCHIVE_ENABLED and CLOUD_ARCHIVE_PROVIDER:
+                    def _on_new_videos_for_cloud(file_paths):
+                        from services.cloud_archive_service import wake as _cloud_wake
+                        try:
+                            _cloud_wake()
+                        except Exception as e:
+                            print(
+                                "Warning: cloud archive wake failed: "
+                                f"{e}"
+                            )
+
+                    register_callback(_on_new_videos_for_cloud)
+                    print(
+                        "File watcher → cloud archive worker wake "
+                        "registered"
+                    )
+            except Exception as e:
+                print(
+                    "Warning: Failed to register cloud archive wake "
+                    f"callback: {e}"
+                )
 
             start_watcher(watch_paths)
             print(f"File watcher started for {len(watch_paths)} paths")
@@ -250,28 +334,93 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Warning: Failed to start indexing worker: {e}")
 
-    # Live Event Sync worker: starts BEFORE cloud_archive auto-trigger so
-    # any persistent LES queue (from a prior reboot/WiFi outage) gets
-    # the priority it's contractually owed. The trigger_auto_sync()
-    # call below will then see ready LES work and skip — letting LES
-    # drain first. Worker thread blocks on threading.Event.wait() when
-    # idle (< 0.1% CPU baseline).
+    # Archive queue producer thread (issue #76 Phase 2a). Mirrors the
+    # indexing worker's lifecycle: starts after the watcher is
+    # registered so the boot catch-up scan and the every-60-s rescan
+    # observe the same TeslaCam root. Failure here must never take
+    # down gadget_web. Issue #184 Wave 1 made the producer
+    # unconditional — no enable flag, boot catch-up always runs.
     try:
-        from config import LIVE_EVENT_SYNC_ENABLED
-        if LIVE_EVENT_SYNC_ENABLED:
-            from services.live_event_sync_service import start as _les_start
-            if _les_start():
-                print("Live Event Sync worker started")
+        from config import (
+            ARCHIVE_QUEUE_RESCAN_INTERVAL_SECONDS,
+            ARCHIVE_QUEUE_BOOT_SCAN_DEFER_SECONDS,
+            MAPPING_DB_PATH as _ARCHIVE_QUEUE_DB,
+        )
+        from services.video_service import get_teslacam_path
+        from services import archive_producer
+        tc = get_teslacam_path()
+        if tc:
+            archive_producer.start_producer(
+                tc,
+                db_path=_ARCHIVE_QUEUE_DB,
+                rescan_interval_seconds=(
+                    ARCHIVE_QUEUE_RESCAN_INTERVAL_SECONDS
+                ),
+                boot_scan_defer_seconds=(
+                    ARCHIVE_QUEUE_BOOT_SCAN_DEFER_SECONDS
+                ),
+            )
+            print("Archive queue producer started (Phase 2a)")
     except Exception as e:
-        # LES failure must NEVER take down gadget_web. Log and continue.
-        print(f"Warning: Failed to start Live Event Sync worker: {e}")
+        print(f"Warning: Failed to start archive queue producer: {e}")
 
-    # Auto-start cloud sync if WiFi is already connected and provider is configured.
-    # The dispatcher only fires on WiFi connect events — if the Pi boots into WiFi
-    # (or the service restarts while on WiFi), sync would never start without this.
-    # NOTE: trigger_auto_sync() consults has_ready_live_event_work() and skips
-    # when LES has work, so the LES start above takes effect even on the very
-    # first dispatcher fire.
+    # Archive queue worker thread (issue #76 Phase 2b). Drains
+    # ``archive_queue`` one file at a time, copying USB-side clips
+    # into ``ARCHIVE_DIR`` and enqueueing them into the indexer queue.
+    # The producer above is the only thing that puts rows into the
+    # queue; this worker is the only thing that takes them out. The
+    # legacy ``video_archive_service`` periodic timer has been removed
+    # in favor of this pair.
+    try:
+        from config import (
+            ARCHIVE_DIR,
+            MAPPING_DB_PATH as _ARCHIVE_WORKER_DB,
+        )
+        from services.video_service import get_teslacam_path
+        from services import archive_worker
+        tc = get_teslacam_path()
+        archive_worker.start_worker(
+            _ARCHIVE_WORKER_DB,
+            ARCHIVE_DIR,
+            teslacam_root=tc,
+        )
+        print("Archive queue worker started (Phase 2b)")
+
+        # Phase 2c: archive watchdog + retention prune. Single
+        # daemon thread that observes the queue/worker, exposes
+        # ``/api/archive/status``, and runs the daily retention
+        # prune on ``ArchivedClips``. Pure local-FS observer — it
+        # never touches the USB gadget.
+        try:
+            from services import archive_watchdog
+            archive_watchdog.start_watchdog(
+                _ARCHIVE_WORKER_DB, ARCHIVE_DIR,
+            )
+            print("Archive watchdog started (Phase 2c)")
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"Warning: Failed to start archive watchdog: {e}"
+            )
+    except Exception as e:
+        print(f"Warning: Failed to start archive queue worker: {e}")
+
+    # Wave 4 PR-F4 (issue #184): the standalone Live Event Sync
+    # worker has been deleted. Live-event uploads are now first-class
+    # ``pipeline_queue`` rows enqueued by the file_watcher's
+    # event.json callback (see ``_on_new_event_json`` above) at
+    # ``PRIORITY_LIVE_EVENT`` so the cloud_archive worker picks them
+    # up before any bulk catch-up rows.
+
+    # Auto-start the continuous cloud archive worker (Phase 3b #99).
+    # The worker is a long-lived daemon thread that idles on
+    # threading.Event.wait() (~0.1% CPU) and drains the queue when
+    # poked by the file watcher, NM dispatcher, mode-switch hook, or
+    # manual UI button. Replaces the old one-shot timer + per-trigger
+    # thread spawn pattern.
+    #
+    # Wave 4 PR-F4 (issue #184): the inter-file LES yield has been
+    # removed; live events are pipeline_queue rows at
+    # ``PRIORITY_LIVE_EVENT`` that the worker naturally picks first.
     try:
         from config import (
             CLOUD_ARCHIVE_ENABLED, CLOUD_ARCHIVE_PROVIDER,
@@ -279,33 +428,81 @@ if __name__ == "__main__":
         )
         if (CLOUD_ARCHIVE_ENABLED and CLOUD_ARCHIVE_PROVIDER
                 and os.path.isfile(CLOUD_PROVIDER_CREDS_PATH)):
-            from services.cloud_archive_service import trigger_auto_sync
+            from services.cloud_archive_service import start as _cloud_start
             from services.video_service import get_teslacam_path
             teslacam = get_teslacam_path()
-            if teslacam:
-                trigger_auto_sync(teslacam, CLOUD_ARCHIVE_DB_PATH)
-                print("Cloud auto-sync triggered on startup")
+            if teslacam and _cloud_start(
+                teslacam_path=teslacam, db_path=CLOUD_ARCHIVE_DB_PATH,
+            ):
+                print("Cloud archive worker started (continuous)")
     except Exception as e:
-        print(f"Warning: Cloud auto-sync startup failed: {e}")
+        print(f"Warning: Cloud archive worker start failed: {e}")
 
-    # NOTE: ``MAPPING_INDEX_ON_STARTUP`` is intentionally no longer
-    # honored. The boot catch-up scan above has the same effect with
-    # none of the cost (no full re-parse of clips already indexed).
-    # The config flag is kept in config.yaml for now to avoid breaking
-    # existing installs; it just becomes a no-op.
+    # Idle-time WAL checkpoint service (issue #184 Wave 3 — Phase G).
+    # Runs ``PRAGMA wal_checkpoint(TRUNCATE)`` every ~30 seconds when
+    # no other heavy task holds the task_coordinator lock, pre-empting
+    # the inline auto-checkpoints that would otherwise fight the
+    # archive copies for SDIO bandwidth.
     try:
-        from config import (
-            MAPPING_INDEX_ON_STARTUP, MAPPING_INDEX_ON_MODE_SWITCH,
+        from config import MAPPING_DB_PATH
+        from services import wal_checkpoint_service
+        _wal_dbs = [MAPPING_DB_PATH]
+        try:
+            from config import CLOUD_ARCHIVE_DB_PATH as _WAL_CLOUD_DB
+            _wal_dbs.append(_WAL_CLOUD_DB)
+        except Exception:  # noqa: BLE001
+            pass
+        if wal_checkpoint_service.start(_wal_dbs):
+            print("WAL checkpoint service started (idle-time)")
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: WAL checkpoint service failed to start: {e}")
+
+    # One-time pipeline_queue backfill (issue #184 Wave 4 — Phase I.1).
+    # Idempotent — re-running on every boot is safe (the unique
+    # constraint catches duplicates), AND a one-shot completion flag
+    # in ``kv_meta`` makes subsequent boots a no-op (so we don't
+    # re-scan four legacy tables every restart). Runs on a background
+    # daemon thread so it never blocks the request loop.
+    #
+    # Daemon-thread kill semantics: ``daemon=True`` means the thread
+    # dies abruptly when the process exits. That's fine here because
+    # ``backfill_legacy_queues`` is fully idempotent — a kill in the
+    # middle of one of the per-table loops just means the next boot
+    # re-runs the scan and resumes (the ``ON CONFLICT DO NOTHING``
+    # clause + UNIQUE constraint dedup any partial work). The
+    # one-shot flag is only set on a successful end-to-end run.
+    #
+    # Read more in
+    # ``services.pipeline_queue_service.backfill_legacy_queues``.
+    try:
+        import threading
+        _backfill_logger = logging.getLogger('teslausb.pipeline_backfill')
+
+        def _run_pipeline_backfill():
+            try:
+                from services import pipeline_queue_service
+                counts = pipeline_queue_service.backfill_legacy_queues()
+                if any(counts.values()):
+                    _backfill_logger.info(
+                        "pipeline_queue backfill: %s", counts,
+                    )
+                else:
+                    _backfill_logger.debug(
+                        "pipeline_queue backfill: nothing to do",
+                    )
+            except Exception as e:  # noqa: BLE001
+                _backfill_logger.warning(
+                    "pipeline_queue backfill failed: %s", e,
+                )
+        threading.Thread(
+            target=_run_pipeline_backfill,
+            name='pipeline-backfill',
+            daemon=True,
+        ).start()
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger('teslausb.pipeline_backfill').warning(
+            "failed to schedule pipeline_queue backfill: %s", e,
         )
-        if MAPPING_INDEX_ON_STARTUP or MAPPING_INDEX_ON_MODE_SWITCH:
-            print(
-                "INFO: mapping.index_on_startup / mapping.index_on_mode_switch "
-                "are deprecated and now have no effect. The persistent indexing "
-                "queue + worker handle this automatically — to force a re-scan, "
-                "use the 'Scan for new clips' button on the map page."
-            )
-    except Exception:
-        pass
 
     # Try to use Waitress if available, otherwise fall back to Flask dev server
     try:

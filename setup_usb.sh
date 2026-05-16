@@ -1439,8 +1439,14 @@ $TARGET_USER ALL=(ALL) NOPASSWD: /usr/bin/pkill
 $TARGET_USER ALL=(ALL) NOPASSWD: /usr/bin/nmcli
 
 # Allow cache dropping for exFAT filesystem sync (required for web lock chime updates)
+# and for vfat slab-cache invalidation on the part1 RO mount before each archive
+# scan (issue #71). ``echo 2`` drops slabs only (dentries+inodes) — preserves the
+# page cache that backs the gadget's reads. ``echo 3`` drops both, used after
+# part2 RW remounts where the page cache is already cold.
 $TARGET_USER ALL=(ALL) NOPASSWD: /usr/bin/sh -c echo 3 > /proc/sys/vm/drop_caches
 $TARGET_USER ALL=(ALL) NOPASSWD: /bin/sh -c echo 3 > /proc/sys/vm/drop_caches
+$TARGET_USER ALL=(ALL) NOPASSWD: /usr/bin/sh -c echo 2 > /proc/sys/vm/drop_caches
+$TARGET_USER ALL=(ALL) NOPASSWD: /bin/sh -c echo 2 > /proc/sys/vm/drop_caches
 EOF
 chmod 440 "$SUDOERS_ENTRY"
 
@@ -1508,13 +1514,21 @@ configure_service "$TEMPLATES_DIR/chime_scheduler.service" "$CHIME_SCHEDULER_SER
 CHIME_SCHEDULER_TIMER="/etc/systemd/system/chime_scheduler.timer"
 configure_service "$TEMPLATES_DIR/chime_scheduler.timer" "$CHIME_SCHEDULER_TIMER"
 
-# Cloud archive sync service (oneshot — triggered by timer or web UI)
-CLOUD_SYNC_SERVICE="/etc/systemd/system/cloud_archive_sync.service"
-configure_service "$TEMPLATES_DIR/cloud_archive_sync.service" "$CLOUD_SYNC_SERVICE"
-
-# Cloud archive sync timer (periodic — every 6 hours)
-CLOUD_SYNC_TIMER="/etc/systemd/system/cloud_archive_sync.timer"
-configure_service "$TEMPLATES_DIR/cloud_archive_sync.timer" "$CLOUD_SYNC_TIMER"
+# Phase 3b (#99): the cloud_archive_sync.timer / .service one-shot
+# entry point has been removed. The continuous worker started by
+# gadget_web.service replaces both: a long-lived daemon thread that
+# idles on threading.Event.wait() and drains the queue on
+# file-watcher events, NM dispatcher fires, mode-switch hooks, and
+# manual UI clicks. Disable + remove any pre-existing units from
+# previous installs so we don't keep firing the dead timer.
+if systemctl list-unit-files cloud_archive_sync.timer 2>/dev/null | grep -q cloud_archive_sync; then
+  echo "Removing legacy cloud_archive_sync.timer / .service (replaced by continuous worker)"
+  systemctl disable --now cloud_archive_sync.timer 2>/dev/null || true
+  systemctl disable --now cloud_archive_sync.service 2>/dev/null || true
+  rm -f /etc/systemd/system/cloud_archive_sync.timer
+  rm -f /etc/systemd/system/cloud_archive_sync.service
+  systemctl daemon-reload
+fi
 
 # WiFi monitor service
 WIFI_MONITOR_SERVICE="/etc/systemd/system/wifi-monitor.service"
@@ -1554,14 +1568,10 @@ chmod +x "$SCRIPT_DIR/scripts/boot_deferred_tasks.sh"
 # Enable and start chime scheduler timer
 systemctl enable --now chime_scheduler.timer || systemctl restart chime_scheduler.timer
 
-# Enable cloud archive sync timer (only if cloud archive is enabled in config)
-if [ "$CLOUD_ARCHIVE_ENABLED" = "true" ]; then
-  echo "Cloud archive enabled — starting sync timer"
-  systemctl enable --now cloud_archive_sync.timer || systemctl restart cloud_archive_sync.timer
-else
-  echo "Cloud archive not enabled — sync timer disabled (enable in config.yaml)"
-  systemctl disable cloud_archive_sync.timer 2>/dev/null || true
-fi
+# Phase 3b (#99): cloud_archive_sync.timer is gone — the continuous
+# worker inside gadget_web.service handles all cloud sync triggers
+# (file watcher, NM dispatcher, mode switch, manual UI). The block
+# above already removed any stale unit files from previous installs.
 
 # Enable and start WiFi monitoring service
 systemctl enable --now wifi-monitor.service || systemctl restart wifi-monitor.service
@@ -1669,9 +1679,13 @@ cat > "$WATCHDOG_CONF" <<'EOF'
 # Watchdog device
 watchdog-device = /dev/watchdog
 
-# Watchdog timeout (hardware reset after 60 seconds of no response)
-# Note: 60s needed for large disk images (400GB+) which take longer to configure
-watchdog-timeout = 60
+# Watchdog timeout (hardware reset after 90 seconds of no response)
+# Note: 90s gives headroom for transient SDIO bus contention on the
+# Pi Zero 2 W (the SD card and WiFi chip share one SDIO controller).
+# A heavy archive catch-up + concurrent Tesla writes + WiFi traffic
+# can briefly stall the watchdog daemon; 60s was sometimes enough to
+# trigger spurious reboots during 1000+ clip backlog drains.
+watchdog-timeout = 90
 
 # Reboot if 1-minute load average exceeds 24 (6x the 4 cores).
 # A spiky-but-recovering workload won't trip this.
@@ -1691,6 +1705,39 @@ priority = 1
 EOF
 chmod 644 "$WATCHDOG_CONF"
 echo "  Applied TeslaUSB watchdog configuration"
+
+# Issue #104 mitigation D: boost the watchdog daemon's CPU + I/O
+# scheduling so a heavy archive backlog drain (which saturates the
+# shared SDIO controller on the Pi Zero 2 W) cannot starve it long
+# enough to miss its /dev/watchdog ping window. Without this the
+# daemon inherits default Nice=0 + best-effort I/O, which a
+# CPU-bound load 7+ + saturated SDIO can deprive of slices for the
+# ~3-6 minutes a single contended _atomic_copy takes — long enough
+# to exceed the 90s hardware-watchdog timeout. The drop-in is always
+# overwritten so a corrupted prior file can't survive.
+WATCHDOG_DROPIN_DIR="/etc/systemd/system/watchdog.service.d"
+WATCHDOG_DROPIN_FILE="${WATCHDOG_DROPIN_DIR}/teslausb-priority.conf"
+echo "Configuring watchdog.service priority drop-in (issue #104)..."
+mkdir -p "$WATCHDOG_DROPIN_DIR"
+cat > "$WATCHDOG_DROPIN_FILE" <<'EOF'
+# TeslaUSB watchdog.service priority boost (issue #104)
+#
+# Why: the Pi Zero 2 W shares one SDIO controller between the SD card
+# and the WiFi chip. A heavy archive backlog drain (Tesla writing
+# 6 MB/s + archive reads + indexer parses + SD writes) can saturate
+# the bus and CPU long enough to starve the userspace watchdog daemon
+# for several minutes, missing its 90 s /dev/watchdog ping window and
+# triggering a hardware reset. Boosting Nice + giving it realtime I/O
+# priority makes the daemon scheduler-resilient without affecting
+# correctness — it does negligible work per tick.
+[Service]
+Nice=-5
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+EOF
+chmod 644 "$WATCHDOG_DROPIN_FILE"
+systemctl daemon-reload
+echo "  Installed $WATCHDOG_DROPIN_FILE"
 
 # Enable and start watchdog service
 echo "Enabling watchdog service..."

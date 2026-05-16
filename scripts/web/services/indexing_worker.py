@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 from services import mapping_service
+from services import indexing_queue_service as queue_svc
 from services import task_coordinator
 
 logger = logging.getLogger(__name__)
@@ -254,8 +255,8 @@ def get_worker_status() -> Dict[str, Any]:
     """Snapshot for the /api/index/status endpoint and the UI banner.
 
     Combines in-memory worker state with a fresh
-    :func:`mapping_service.get_queue_status` snapshot so callers get
-    everything in one round-trip.
+    :func:`indexing_queue_service.get_queue_status` snapshot so callers
+    get everything in one round-trip.
     """
     with _state_lock:
         snap = {
@@ -275,7 +276,7 @@ def get_worker_status() -> Dict[str, Any]:
         db_path = _db_path
     if db_path:
         try:
-            snap.update(mapping_service.get_queue_status(db_path))
+            snap.update(queue_svc.get_queue_status(db_path))
         except Exception as e:  # noqa: BLE001 — status must never raise
             logger.warning("get_queue_status failed inside status: %s", e)
             snap['queue_depth'] = None
@@ -338,7 +339,7 @@ def process_claimed_item(
         logger.exception(
             "Indexer raised unexpectedly for %s; deferring", file_path,
         )
-        backoff = mapping_service.compute_backoff(attempts)
+        backoff = queue_svc.compute_backoff(attempts)
         return WorkerAction(
             action='defer',
             next_attempt_at=now_fn() + backoff,
@@ -382,7 +383,7 @@ def process_claimed_item(
         )
 
     if outcome == IO.PARSE_ERROR:
-        backoff = mapping_service.compute_backoff(attempts)
+        backoff = queue_svc.compute_backoff(attempts)
         return WorkerAction(
             action='defer', next_attempt_at=now_fn() + backoff,
             bump_attempts=True, last_error=result.error,
@@ -414,7 +415,7 @@ def _apply_action(action: WorkerAction, row: Dict[str, Any],
     claimed_at = row.get('claimed_at')
 
     if action.action == 'complete':
-        mapping_service.complete_queue_item(
+        queue_svc.complete_queue_item(
             db_path, canonical_key_value,
             claimed_by=claimed_by, claimed_at=claimed_at,
         )
@@ -429,7 +430,7 @@ def _apply_action(action: WorkerAction, row: Dict[str, Any],
                     action.purge_path, e,
                 )
     elif action.action == 'defer':
-        mapping_service.defer_queue_item(
+        queue_svc.defer_queue_item(
             db_path, canonical_key_value,
             next_attempt_at=action.next_attempt_at or 0.0,
             bump_attempts=action.bump_attempts,
@@ -437,7 +438,7 @@ def _apply_action(action: WorkerAction, row: Dict[str, Any],
             claimed_by=claimed_by, claimed_at=claimed_at,
         )
     elif action.action == 'release':
-        mapping_service.release_claim(
+        queue_svc.release_claim(
             db_path, canonical_key_value,
             claimed_by=claimed_by, claimed_at=claimed_at,
         )
@@ -482,34 +483,68 @@ def _record_idle(last_outcome: Optional[mapping_service.IndexOutcome] = None,
 
 
 def _apply_low_priority() -> None:
-    """Best-effort drop to nice 19 + SCHED_BATCH on Linux.
+    """Best-effort drop the **calling thread** to lowest CPU + I/O priority.
 
-    No-ops on platforms (Windows/macOS) where the syscalls are missing
-    or fail. Any exception is swallowed — priority adjustment is a
-    nice-to-have, not a correctness requirement.
+    Critical: this MUST be thread-local. Earlier versions called
+    ``os.nice(19)``, which on Linux/glibc lowers the WHOLE PROCESS
+    priority — making the Flask request handlers and every other
+    thread in ``gadget_web`` low-priority too. That caused
+    ``/api/index/status`` and ``/`` to time out at 10 s during boot
+    catchup (issue #72).
+
+    What's safe to use from a worker thread:
+
+    * ``os.sched_setscheduler(0, SCHED_IDLE, ...)`` — the ``0`` first
+      argument means "this thread" on Linux (per ``sched_setscheduler(2)``).
+      ``SCHED_IDLE`` (constant 5) only runs when nothing else wants the
+      CPU, which is exactly what we want for indexing.
+    * ``ionice -c 3 -p <native_tid>`` — Linux ``ioprio_set`` is also
+      per-task; we pass ``threading.get_native_id()`` so the I/O-idle
+      class applies to the indexer thread only, not to the Flask
+      handler thread that happens to be processing a request when
+      this gets called.
+
+    No-ops on platforms (Windows/macOS) or Python builds where the
+    syscalls/CLI tools are missing. Any failure is swallowed —
+    priority adjustment is a nice-to-have, not a correctness
+    requirement.
     """
+    if not sys.platform.startswith('linux'):
+        return
+
+    # CPU scheduling — SCHED_IDLE is thread-local with first arg = 0.
     try:
-        os.nice(19)
-    except (OSError, AttributeError, ValueError):
+        SCHED_IDLE = 5
+        if hasattr(os, 'sched_setscheduler') and hasattr(os, 'sched_param'):
+            os.sched_setscheduler(  # type: ignore[attr-defined]
+                0, SCHED_IDLE, os.sched_param(0),  # type: ignore[attr-defined]
+            )
+    except (OSError, PermissionError, AttributeError):
+        # Some kernels/cgroups refuse SCHED_IDLE for non-root; that's
+        # fine — we still get the I/O priority drop below.
         pass
-    if sys.platform.startswith('linux'):
-        try:
-            # SCHED_BATCH = 3 on Linux; not exposed in stdlib for all
-            # Python builds, so we use the raw constant.
-            SCHED_BATCH = 3
-            if hasattr(os, 'sched_setscheduler') and hasattr(os, 'sched_param'):
-                os.sched_setscheduler(  # type: ignore[attr-defined]
-                    0, SCHED_BATCH, os.sched_param(0),  # type: ignore[attr-defined]
-                )
-        except (OSError, PermissionError, AttributeError):
-            pass
+
+    # I/O scheduling — ionice on the calling thread's TID, not the PID.
+    # ``threading.get_native_id()`` returns the kernel TID on Linux
+    # (Python 3.8+); ionice -p accepts a TID transparently because
+    # Linux's ioprio_set syscall operates per-task.
+    try:
+        import subprocess
+        tid = threading.get_native_id()
+        subprocess.run(
+            ["ionice", "-c", "3", "-p", str(tid)],
+            timeout=5, capture_output=True, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired,
+            OSError, AttributeError):
+        pass
 
 
 def _run_worker_loop(db_path: str, teslacam_root: str, worker_id: str) -> None:
     """The thread target. One file at a time, until stop is signaled."""
     _apply_low_priority()
     try:
-        released = mapping_service.recover_stale_claims(db_path)
+        released = queue_svc.recover_stale_claims(db_path)
         if released:
             logger.info(
                 "Worker %s released %d stale claims at startup",
@@ -552,7 +587,7 @@ def _run_worker_loop(db_path: str, teslacam_root: str, worker_id: str) -> None:
         claim_failed = False
         try:
             try:
-                row = mapping_service.claim_next_queue_item(
+                row = queue_svc.claim_next_queue_item(
                     db_path, worker_id,
                 )
             except Exception as e:  # noqa: BLE001
@@ -618,7 +653,7 @@ def _process_one(row: Dict[str, Any], db_path: str,
             "Worker dispatch failed for %s; releasing claim", file_path,
         )
         try:
-            mapping_service.release_claim(
+            queue_svc.release_claim(
                 db_path, canonical_key_value,
                 claimed_by=row.get('claimed_by'),
                 claimed_at=claimed_at,

@@ -22,10 +22,12 @@ def _reset_watcher_state():
     # Clear callback lists so callbacks from one test don't leak.
     fws._on_new_file_callbacks.clear()
     fws._on_deleted_file_callbacks.clear()
+    fws._on_archive_callbacks.clear()
     yield
     fws.stop_watcher(timeout=2.0)
     fws._on_new_file_callbacks.clear()
     fws._on_deleted_file_callbacks.clear()
+    fws._on_archive_callbacks.clear()
 
 
 class TestLifecycle:
@@ -94,8 +96,13 @@ class TestGenerationGuard:
         received = []
         fws.register_callback(lambda paths: received.extend(paths))
         current = fws._watcher_generation
-        fws._notify_callbacks(["/a/b.mp4"], my_generation=current)
-        assert received == ["/a/b.mp4"]
+        # Phase 2b: indexing callbacks only fire for paths under
+        # ARCHIVE_DIR. Use a real ArchivedClips-prefixed path so the
+        # classifier routes it correctly; otherwise it gets dropped.
+        prefix = fws._archive_dir_prefix() or '/tmp'
+        path = os.path.join(prefix, 'a', 'b.mp4')
+        fws._notify_callbacks([path], my_generation=current)
+        assert received == [path]
 
     def test_stale_delete_callbacks_are_dropped(self):
         deleted = []
@@ -198,3 +205,407 @@ class TestPollingDeleteDetection:
             assert any(p.endswith('-front.mp4') for p in deleted_paths)
         finally:
             fws.stop_watcher(timeout=3.0)
+
+
+class TestArchiveCallback:
+    """Phase 2a archive_queue producer + Phase 2b path-classified routing
+    (issue #76).
+
+    Phase 2a wired the archive callback list parallel to the existing
+    mp4 callback list. Phase 2b changed ``_notify_callbacks`` to
+    classify paths and route them to ONE list or the OTHER (never
+    both): paths under the RO USB mount fire only archive callbacks;
+    paths under ``ARCHIVE_DIR`` fire only indexing callbacks.
+
+    These tests pin both behaviors. Paths use ``_ro_mount_prefixes`` /
+    ``_archive_dir_prefix`` rather than hardcoded strings so the tests
+    survive future changes to the default mount layout.
+    """
+
+    @staticmethod
+    def _ro_path(name: str) -> str:
+        prefixes = fws._ro_mount_prefixes()
+        # Use the first candidate (``<MNT_DIR>/part1-ro``); both are
+        # valid but the first matches what production uses.
+        return os.path.join(prefixes[0], 'TeslaCam', 'RecentClips', name)
+
+    @staticmethod
+    def _archive_path(name: str) -> str:
+        prefix = fws._archive_dir_prefix()
+        if not prefix:
+            pytest.skip("ARCHIVE_DIR not configured in this environment")
+        return os.path.join(prefix, 'RecentClips', name)
+
+    def test_register_archive_callback_appends_to_list(self):
+        before = len(fws._on_archive_callbacks)
+        fws.register_archive_callback(lambda paths: None)
+        assert len(fws._on_archive_callbacks) == before + 1
+
+    def test_archive_callback_fires_alongside_mp4_callback(self):
+        # Phase 2b: a single batch with one RO-mount path AND one
+        # ArchivedClips path must split — RO fires archive only,
+        # ArchivedClips fires indexing only. The two callback lists
+        # see disjoint subsets of the original batch.
+        mp4_received = []
+        archive_received = []
+        fws.register_callback(lambda paths: mp4_received.extend(paths))
+        fws.register_archive_callback(
+            lambda paths: archive_received.extend(paths)
+        )
+        ro_a = self._ro_path('a.mp4')
+        ro_b = self._ro_path('b.mp4')
+        arch_c = self._archive_path('c.mp4')
+        current = fws._watcher_generation
+        fws._notify_callbacks([ro_a, ro_b, arch_c],
+                              my_generation=current)
+        # RO-mount paths route to archive only.
+        assert archive_received == [ro_a, ro_b]
+        # ArchivedClips path routes to indexing only.
+        assert mp4_received == [arch_c]
+
+    def test_archive_callback_dropped_when_generation_stale(self):
+        # Same generation guard as the mp4 callbacks: a stale batch
+        # must not fire archive callbacks either.
+        archive_received = []
+        fws.register_archive_callback(
+            lambda paths: archive_received.extend(paths)
+        )
+        captured = fws._watcher_generation
+        fws._watcher_generation = captured + 1  # simulate stop_watcher bump
+        try:
+            fws._notify_callbacks([self._ro_path('x.mp4')],
+                                  my_generation=captured)
+        finally:
+            fws._watcher_generation = captured
+        assert archive_received == []
+
+    def test_archive_callback_exception_does_not_block_others(self):
+        # One bad archive subscriber can't starve a second one.
+        good_received = []
+
+        def bad_cb(paths):
+            raise RuntimeError("synthetic bad subscriber")
+
+        fws.register_archive_callback(bad_cb)
+        fws.register_archive_callback(
+            lambda paths: good_received.extend(paths)
+        )
+        ro_y = self._ro_path('y.mp4')
+        current = fws._watcher_generation
+        fws._notify_callbacks([ro_y], my_generation=current)
+        assert good_received == [ro_y]
+
+    def test_no_archive_callback_when_none_registered(self):
+        # Sanity: empty archive list, mp4 callback still fires for
+        # ArchivedClips paths (RO-mount paths would just be silently
+        # routed to the empty archive list — also fine).
+        mp4_received = []
+        fws.register_callback(lambda paths: mp4_received.extend(paths))
+        arch_z = self._archive_path('z.mp4')
+        current = fws._watcher_generation
+        # Should not raise even though _on_archive_callbacks is empty.
+        fws._notify_callbacks([arch_z], my_generation=current)
+        assert mp4_received == [arch_z]
+
+    def test_mp4_callback_exception_does_not_block_archive(self):
+        """The two callback lists are independent — one bad mp4
+        subscriber must not prevent the archive callback from firing.
+
+        Phase 2b: the bad mp4 subscriber receives ArchivedClips paths;
+        the archive callback receives RO-mount paths. They no longer
+        overlap on the same path, so this test sends one of each and
+        verifies BOTH still fire even when the mp4 side raises."""
+        archive_received = []
+
+        def bad_mp4(paths):
+            raise RuntimeError("bad mp4 subscriber")
+
+        fws.register_callback(bad_mp4)
+        fws.register_archive_callback(
+            lambda paths: archive_received.extend(paths)
+        )
+        ro_q = self._ro_path('q.mp4')
+        arch_q = self._archive_path('q.mp4')
+        current = fws._watcher_generation
+        fws._notify_callbacks([ro_q, arch_q], my_generation=current)
+        assert archive_received == [ro_q]
+
+
+class TestPathClassification:
+    """Phase 2b routing rule pinned by direct unit tests on
+    :func:`_classify_paths` (issue #76)."""
+
+    def test_ro_mount_path_routes_to_archive(self):
+        ro = os.path.join(fws._ro_mount_prefixes()[0], 'TeslaCam', 'foo.mp4')
+        archive, indexing, dropped = fws._classify_paths([ro])
+        assert archive == [ro]
+        assert indexing == []
+        assert dropped == []
+
+    def test_archive_dir_path_routes_to_indexing(self):
+        prefix = fws._archive_dir_prefix()
+        if not prefix:
+            pytest.skip("ARCHIVE_DIR not configured")
+        arch = os.path.join(prefix, 'RecentClips', 'bar.mp4')
+        archive, indexing, dropped = fws._classify_paths([arch])
+        assert archive == []
+        assert indexing == [arch]
+        assert dropped == []
+
+    def test_unrelated_path_dropped(self):
+        # /tmp/foo.mp4 belongs to neither prefix.
+        archive, indexing, dropped = fws._classify_paths(
+            ['/random/scratch/foo.mp4'],
+        )
+        assert archive == []
+        assert indexing == []
+        assert dropped == ['/random/scratch/foo.mp4']
+
+    def test_empty_string_skipped(self):
+        archive, indexing, dropped = fws._classify_paths(['', None])
+        assert archive == []
+        assert indexing == []
+        assert dropped == []
+
+    def test_archive_prefix_wins_when_both_match(self, monkeypatch):
+        # Defensive: if someone misconfigures ARCHIVE_DIR to live
+        # under the RO mount (it shouldn't, but…), the archive prefix
+        # check runs first and routes to indexing. This stops a
+        # double-enqueue that would otherwise re-archive a file the
+        # worker just wrote.
+        ro_root = fws._ro_mount_prefixes()[0]
+        weird = os.path.join(ro_root, 'ArchivedClips')
+        monkeypatch.setattr(fws, '_archive_dir_prefix', lambda: weird)
+        path = os.path.join(weird, 'RecentClips', 'q.mp4')
+        archive, indexing, dropped = fws._classify_paths([path])
+        assert archive == []
+        assert indexing == [path]
+        assert dropped == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #214 — VFS cache invalidation in polling fallback
+# ---------------------------------------------------------------------------
+
+class TestPollingRefreshesRoMount:
+    """Pin issue #214 fix on the polling-fallback side: when inotify
+    is unavailable the polling loop is the ONLY mechanism that can
+    detect Tesla's gadget-block-layer writes on the RO USB mount,
+    and inotify itself doesn't fire for those writes (they bypass
+    VFS). Without ``_refresh_ro_mount`` the loop reads a frozen
+    dentry cache and misses Tesla's clips before Tesla's RecentClips
+    circular buffer rotates them out.
+    """
+
+    def test_polling_loop_calls_refresh_ro_mount_each_tick(
+        self, tmp_path, monkeypatch,
+    ):
+        # Force polling mode and make the loop tick fast.
+        monkeypatch.setattr(fws, '_try_inotify', lambda *a, **k: False)
+        monkeypatch.setattr(fws, '_POLL_INTERVAL_SECONDS', 0.2)
+        monkeypatch.setattr(fws, '_MIN_FILE_AGE_SECONDS', 0)
+        # Drop the rate-limit floor below the polling cadence so each
+        # tick can refresh in this fast-loop test (production keeps
+        # the 60s floor).
+        monkeypatch.setattr(fws, '_RO_CACHE_MIN_REFRESH_INTERVAL_S', 0.0)
+
+        call_count = {'n': 0}
+        captured: list[str] = []
+
+        def counter(path):
+            call_count['n'] += 1
+            captured.append(path)
+
+        # Patch the symbol that the lazy import inside the helper
+        # resolves to.
+        import services.mapping_service as ms
+        monkeypatch.setattr(ms, '_refresh_ro_mount', counter)
+
+        assert fws.start_watcher([str(tmp_path)]) is True
+        try:
+            # Wait long enough for ~3 polling ticks at 0.2s each.
+            time.sleep(0.9)
+        finally:
+            fws.stop_watcher(timeout=3.0)
+
+        assert call_count['n'] >= 2, (
+            f"polling loop must call _refresh_ro_mount on each tick, "
+            f"got {call_count['n']} calls in ~0.9s with 0.2s interval"
+        )
+        # Cache evict is process-global, so we only call once per
+        # tick even with multiple watch paths — pin that exactly one
+        # path was passed (the first one we registered).
+        assert all(p == str(tmp_path) for p in captured), (
+            f"polling loop must pass a registered watch path, "
+            f"got {captured}"
+        )
+
+    def test_polling_loop_survives_refresh_failure(
+        self, tmp_path, monkeypatch,
+    ):
+        """Broken refresh must NOT kill the polling thread — without
+        this guard, a misconfigured sudoers entry would silently
+        disable Tesla's last-resort discovery path on Pis where
+        inotify is unavailable.
+        """
+        monkeypatch.setattr(fws, '_try_inotify', lambda *a, **k: False)
+        monkeypatch.setattr(fws, '_POLL_INTERVAL_SECONDS', 0.2)
+        monkeypatch.setattr(fws, '_MIN_FILE_AGE_SECONDS', 0)
+        monkeypatch.setattr(fws, '_RO_CACHE_MIN_REFRESH_INTERVAL_S', 0.0)
+
+        # Use a call counter — checking _status['last_scan'] would be
+        # ambiguous because that field is also set during the initial
+        # scan BEFORE the polling loop runs (file_watcher_service.py
+        # ~L723), so a crash on the first polling iteration would
+        # still leave last_scan != None and falsely pass.
+        call_count = {'n': 0}
+
+        def boom(_path):
+            call_count['n'] += 1
+            raise RuntimeError("simulated broken sudoers")
+
+        import services.mapping_service as ms
+        monkeypatch.setattr(ms, '_refresh_ro_mount', boom)
+
+        assert fws.start_watcher([str(tmp_path)]) is True
+        try:
+            # Wait long enough for ~3 polling ticks at 0.2s each.
+            time.sleep(0.9)
+        finally:
+            fws.stop_watcher(timeout=3.0)
+
+        # >= 2 calls proves the polling loop survived the first raise
+        # and iterated again — the actual contract we want to pin.
+        assert call_count['n'] >= 2, (
+            f"polling loop crashed on refresh failure — got "
+            f"{call_count['n']} refresh attempts in ~0.9s with 0.2s "
+            "interval (expected >= 2)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #214 — _maybe_refresh_ro_cache rate-limited helper
+# ---------------------------------------------------------------------------
+
+class TestMaybeRefreshRoCache:
+    """Pin the rate-limit semantics so the inotify event-loop's
+    high-frequency periodic-scan path doesn't generate a global slab
+    evict on every event burst (which would saturate SDIO on the
+    Pi Zero 2 W).
+    """
+
+    def test_first_call_always_refreshes(self, monkeypatch):
+        """Bootstrapping with last_refresh_monotonic=0.0 must always
+        cross the rate-limit threshold so the very first scan after
+        startup gets a fresh cache.
+        """
+        calls = {'n': 0}
+
+        def counter(_path):
+            calls['n'] += 1
+
+        import services.mapping_service as ms
+        monkeypatch.setattr(ms, '_refresh_ro_mount', counter)
+
+        result = fws._maybe_refresh_ro_cache(
+            ['/some/path'], last_refresh_monotonic=0.0,
+            min_interval=60.0,
+        )
+
+        assert calls['n'] == 1, "first call must always refresh"
+        assert result > 0.0, "must return a non-zero monotonic time"
+
+    def test_rate_limited_within_interval(self, monkeypatch):
+        """Two calls within the rate-limit interval must produce
+        only one refresh — the second is gated.
+        """
+        calls = {'n': 0}
+
+        def counter(_path):
+            calls['n'] += 1
+
+        import services.mapping_service as ms
+        monkeypatch.setattr(ms, '_refresh_ro_mount', counter)
+
+        # Use a real recent timestamp so the second call is gated.
+        now = time.monotonic()
+        result = fws._maybe_refresh_ro_cache(
+            ['/some/path'], last_refresh_monotonic=now,
+            min_interval=60.0,
+        )
+
+        assert calls['n'] == 0, "call within rate-limit must NOT refresh"
+        assert result == now, (
+            "rate-limited call must return the original timestamp "
+            "unchanged so subsequent gating math stays accurate"
+        )
+
+    def test_call_after_interval_refreshes(self, monkeypatch):
+        """Once the rate-limit interval has elapsed, the next call
+        must refresh.
+        """
+        calls = {'n': 0}
+
+        def counter(_path):
+            calls['n'] += 1
+
+        import services.mapping_service as ms
+        monkeypatch.setattr(ms, '_refresh_ro_mount', counter)
+
+        # Force "interval has passed" by passing a stale timestamp.
+        stale = time.monotonic() - 120.0
+        result = fws._maybe_refresh_ro_cache(
+            ['/some/path'], last_refresh_monotonic=stale,
+            min_interval=60.0,
+        )
+
+        assert calls['n'] == 1, "call after rate-limit must refresh"
+        assert result > stale, "must update the timestamp"
+
+    def test_failure_still_bumps_timestamp(self, monkeypatch):
+        """If the refresh raises, we MUST still bump the timestamp —
+        otherwise a broken sudoers entry would attempt the failing
+        refresh on every iteration of the inotify event loop and
+        spam logs every few milliseconds.
+        """
+        def boom(_path):
+            raise RuntimeError("simulated broken sudoers")
+
+        import services.mapping_service as ms
+        monkeypatch.setattr(ms, '_refresh_ro_mount', boom)
+
+        before = time.monotonic()
+        result = fws._maybe_refresh_ro_cache(
+            ['/some/path'], last_refresh_monotonic=0.0,
+            min_interval=60.0,
+        )
+
+        assert result >= before, (
+            f"failure must still bump timestamp to avoid log spam; "
+            f"got {result} expected >= {before}"
+        )
+
+    def test_empty_paths_is_a_noop(self, monkeypatch):
+        """An empty paths list should not call _refresh_ro_mount at
+        all — there is nothing to log about and skipping the call
+        avoids triggering it before any watch paths are registered.
+        """
+        calls = {'n': 0}
+
+        def counter(_path):
+            calls['n'] += 1
+
+        import services.mapping_service as ms
+        monkeypatch.setattr(ms, '_refresh_ro_mount', counter)
+
+        result = fws._maybe_refresh_ro_cache(
+            [], last_refresh_monotonic=0.0, min_interval=60.0,
+        )
+
+        assert calls['n'] == 0, (
+            "empty paths must not trigger _refresh_ro_mount"
+        )
+        assert result > 0.0, (
+            "must still bump timestamp so an empty-paths cycle doesn't "
+            "wedge subsequent calls into perpetual gate-checking"
+        )

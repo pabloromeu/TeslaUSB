@@ -14,7 +14,6 @@ import json
 import logging
 import math
 import os
-import shutil
 import sqlite3
 import subprocess
 import threading
@@ -25,6 +24,58 @@ from enum import Enum
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3c.2 (#100): re-export schema/migration symbols.
+# ``_init_db`` is the connection factory used by every query function in
+# this module and by ~100 test sites. Re-exporting it (along with
+# ``_backup_db``, ``_SCHEMA_VERSION``, and ``_BACKUP_RETENTION``) keeps all
+# existing call sites working unchanged after the move.
+# New code should import from ``services.mapping_migrations`` directly.
+# ---------------------------------------------------------------------------
+from services.mapping_migrations import (  # noqa: E402,F401
+    _BACKUP_RETENTION,
+    _SCHEMA_SQL,
+    _SCHEMA_VERSION,
+    _backup_db,
+    _init_db,
+    _migrate_v2_to_v3,
+    _migrate_v3_to_v4,
+)
+
+
+# ---------------------------------------------------------------------------
+# Cold telemetry signal thresholds (issue #184 Wave 3 — Phase D)
+# ---------------------------------------------------------------------------
+# The accelerometer and steering sensors on a Tesla rarely report exactly
+# 0.0 even when stationary — IMU noise floors are typically ±0.001 to
+# ±0.05 m/s² and steering can show ±0.1° from sensor jitter. Without an
+# absolute-tolerance check, a parked-car Sentry event (10 000+ waypoints
+# in a single day) ends up with one ``waypoints_cold`` row per waypoint,
+# defeating the entire reason for the hot/cold split. The thresholds
+# below are calibrated to be well below any real driving maneuver while
+# above the documented sensor noise floor.
+#
+# These constants are also used by the v14→v15 migration WHERE clause in
+# ``mapping_migrations._migrate_v14_to_v15`` so backfill semantics match
+# the runtime path exactly. If you change a value here, change the
+# migration too — the matching ``_GEAR_NO_SIGNAL`` set is also exported.
+_COLD_ACCEL_THRESHOLD_MPS2 = 0.05
+_COLD_STEERING_THRESHOLD_DEG = 0.5
+
+# Gear states that carry no useful cold-telemetry signal:
+#  * 'UNKNOWN' — SEI parser emitted a value outside the documented
+#    enum (``_GEAR_NAMES`` in ``sei_parser``); usually a partial or
+#    corrupted SEI frame.
+#  * 'PARK'    — vehicle is stationary; every Sentry/Saved event clip
+#    on a parked car carries gear='PARK' for all 30 Hz × 60 s = 1 800
+#    waypoints. Recording 1 800 identical "still parked" cold rows per
+#    parked event would dwarf the few thousand driving rows that
+#    actually carry telemetry signal.
+# Other gear states (DRIVE / REVERSE / NEUTRAL) imply the vehicle is in
+# motion or about to move — record those.
+_COLD_GEAR_NO_SIGNAL = frozenset({'UNKNOWN', 'PARK'})
 
 
 # ---------------------------------------------------------------------------
@@ -140,472 +191,16 @@ def _with_db_retry(fn: Callable) -> Callable:
 
 
 # ---------------------------------------------------------------------------
-# Database Schema & Management
+# Database Schema & Migrations (Phase 3c.2 — moved to services.mapping_migrations)
 # ---------------------------------------------------------------------------
-
-_SCHEMA_VERSION = 9
-_BACKUP_RETENTION = 3  # Keep this many migration backups before pruning oldest
-
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY
-);
-
-CREATE TABLE IF NOT EXISTS trips (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    start_time TEXT NOT NULL,
-    end_time TEXT,
-    start_lat REAL,
-    start_lon REAL,
-    end_lat REAL,
-    end_lon REAL,
-    distance_km REAL DEFAULT 0.0,
-    duration_seconds INTEGER DEFAULT 0,
-    source_folder TEXT,
-    indexed_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS waypoints (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
-    timestamp TEXT NOT NULL,
-    lat REAL NOT NULL,
-    lon REAL NOT NULL,
-    heading REAL,
-    speed_mps REAL,
-    acceleration_x REAL,
-    acceleration_y REAL,
-    acceleration_z REAL,
-    gear TEXT,
-    autopilot_state TEXT,
-    steering_angle REAL,
-    brake_applied INTEGER DEFAULT 0,
-    blinker_on_left INTEGER DEFAULT 0,
-    blinker_on_right INTEGER DEFAULT 0,
-    video_path TEXT,
-    frame_offset INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS detected_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trip_id INTEGER REFERENCES trips(id) ON DELETE CASCADE,
-    timestamp TEXT NOT NULL,
-    lat REAL,
-    lon REAL,
-    event_type TEXT NOT NULL,
-    severity TEXT DEFAULT 'info',
-    description TEXT,
-    video_path TEXT,
-    frame_offset INTEGER,
-    metadata TEXT
-);
-
-CREATE TABLE IF NOT EXISTS indexed_files (
-    file_path TEXT PRIMARY KEY,
-    file_size INTEGER,
-    file_mtime REAL,
-    indexed_at TEXT,
-    waypoint_count INTEGER DEFAULT 0,
-    event_count INTEGER DEFAULT 0
-);
-
--- Persistent indexing work queue. One row per pending clip, keyed by
--- canonical_key (RecentClips/ArchivedClips dedup, Saved/Sentry events
--- disambiguated by event folder — see canonical_key()). The single
--- worker thread (services.indexing_worker) drains this; producers
--- (file watcher, archive job, manual button, boot catch-up) just
--- INSERT rows. claimed_by/claimed_at let the worker take an exclusive
--- claim atomically; stale claims (>30 min) are auto-released so a
--- crashed worker can't permanently lock a row.
-CREATE TABLE IF NOT EXISTS indexing_queue (
-    canonical_key TEXT PRIMARY KEY,
-    file_path TEXT NOT NULL,
-    priority INTEGER NOT NULL DEFAULT 50,
-    enqueued_at REAL NOT NULL,
-    next_attempt_at REAL NOT NULL DEFAULT 0,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-    claimed_by TEXT,
-    claimed_at REAL,
-    source TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_waypoints_trip ON waypoints(trip_id);
-CREATE INDEX IF NOT EXISTS idx_waypoints_coords ON waypoints(lat, lon);
-CREATE INDEX IF NOT EXISTS idx_waypoints_timestamp ON waypoints(timestamp);
-CREATE INDEX IF NOT EXISTS idx_waypoints_video_path ON waypoints(video_path);
--- Covering index for query_trips' video_count subquery: lets SQLite count
--- DISTINCT video_path per trip without touching the main waypoints table.
--- Without this, /api/trips fans out to 1 + 2N queries (where N = page size)
--- and visibly stalls the map page on databases with thousands of waypoints.
-CREATE INDEX IF NOT EXISTS idx_waypoints_trip_video
-    ON waypoints(trip_id, video_path);
--- Day-based aggregate (/api/days) and per-day route lookup
--- (/api/day/<date>/routes) both filter by substr(start_time,1,10).
--- v7: ``idx_trips_start_time`` keeps a sortable-text scan available
--- for callers that filter by ``start_time >= ?`` (e.g. /api/trips with
--- date_from/date_to).
-CREATE INDEX IF NOT EXISTS idx_trips_start_time ON trips(start_time);
-CREATE INDEX IF NOT EXISTS idx_events_trip ON detected_events(trip_id);
-CREATE INDEX IF NOT EXISTS idx_events_coords ON detected_events(lat, lon);
-CREATE INDEX IF NOT EXISTS idx_events_type ON detected_events(event_type);
-CREATE INDEX IF NOT EXISTS idx_events_timestamp ON detected_events(timestamp);
--- v8: expression indexes on substr(<ts>, 1, 10) for the day-based
--- queries (/api/days, /api/day/<date>/routes, /api/events?date=).
--- Plain idx_trips_start_time / idx_events_timestamp are NOT used by
--- SQLite when the WHERE clause wraps the column in substr() — verified
--- via EXPLAIN QUERY PLAN. Without these expression indexes the day
--- view degrades to a full table scan on every nav, which is unusable
--- on a Pi Zero 2 W with a few thousand trips.
-CREATE INDEX IF NOT EXISTS idx_trips_day
-    ON trips(substr(start_time, 1, 10));
-CREATE INDEX IF NOT EXISTS idx_events_day
-    ON detected_events(substr(timestamp, 1, 10));
--- Worker pick-next index: partial index over only unclaimed, ready-to-run
--- rows. Keeps the atomic-claim subquery O(log n) regardless of queue depth.
-CREATE INDEX IF NOT EXISTS idx_queue_ready
-    ON indexing_queue(priority, enqueued_at)
-    WHERE claimed_by IS NULL;
--- Stale-claim recovery scan: lets the worker quickly find rows whose
--- claim has aged out (>30 min, indicating the previous worker crashed).
-CREATE INDEX IF NOT EXISTS idx_queue_claimed_at
-    ON indexing_queue(claimed_at)
-    WHERE claimed_by IS NOT NULL;
-"""
-
-
-def _backup_db(db_path: str, target_version: int) -> Optional[str]:
-    """Make a copy of the DB before a destructive migration.
-
-    Returns the backup path on success, None on failure (migration still proceeds).
-    Old backups beyond ``_BACKUP_RETENTION`` are pruned.
-    """
-    if not os.path.isfile(db_path):
-        return None
-    try:
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_path = f"{db_path}.bak.v{target_version}.{ts}"
-        shutil.copy2(db_path, backup_path)
-        logger.info("Backed up geo-index DB to %s", backup_path)
-
-        # Prune older backups
-        backups = sorted(
-            f for f in os.listdir(os.path.dirname(db_path) or '.')
-            if f.startswith(os.path.basename(db_path) + '.bak.')
-        )
-        if len(backups) > _BACKUP_RETENTION:
-            for old in backups[:-_BACKUP_RETENTION]:
-                try:
-                    os.remove(os.path.join(os.path.dirname(db_path), old))
-                except OSError:
-                    pass
-        return backup_path
-    except Exception as e:
-        logger.warning("Failed to back up DB before migration: %s", e)
-        return None
-
-
-def _init_db(db_path: str) -> sqlite3.Connection:
-    """Initialize the SQLite database with schema if needed."""
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-
-    conn = sqlite3.connect(db_path, timeout=15)
-    conn.row_factory = sqlite3.Row
-    # Tuned for Pi Zero 2 W (512 MB RAM) where mmap exhaustion under
-    # concurrent indexer + web load was producing spurious "disk I/O error"
-    # responses from SQLite. The combination of a small per-connection page
-    # cache, no file mmap, capped WAL size, and frequent autocheckpoint
-    # keeps each connection's memory footprint bounded so we never run out
-    # of address space when many waitress threads open connections in
-    # parallel during a heavy indexer run.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=15000")
-    conn.execute("PRAGMA cache_size=-2000")        # 2 MB per connection
-    conn.execute("PRAGMA mmap_size=0")             # disable file-mmap (saves vmem)
-    conn.execute("PRAGMA temp_store=MEMORY")       # avoid temp files on slow SD
-    conn.execute("PRAGMA journal_size_limit=4194304")   # cap WAL at 4 MB
-    conn.execute("PRAGMA wal_autocheckpoint=200")  # checkpoint every ~800 KB
-    conn.execute("PRAGMA foreign_keys=ON")
-
-    # Check schema version. Older code used INSERT OR REPLACE on a PRIMARY KEY
-    # column, which actually added a new row each time, so older DBs may have
-    # multiple rows. Use MAX() to read the effective version.
-    try:
-        row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
-        current = row['v'] if row and row['v'] is not None else 0
-    except sqlite3.OperationalError:
-        current = 0
-
-    if current < _SCHEMA_VERSION:
-        # Backup before any destructive migration (only when an existing DB
-        # is being upgraded, not on first install)
-        if current > 0:
-            _backup_db(db_path, _SCHEMA_VERSION)
-
-        conn.executescript(_SCHEMA_SQL)
-        # Migrations for existing databases
-        if current < 2:
-            # v2: add blinker columns to waypoints
-            for col in ('blinker_on_left', 'blinker_on_right'):
-                try:
-                    conn.execute(f"ALTER TABLE waypoints ADD COLUMN {col} INTEGER DEFAULT 0")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-        if current > 0 and current < 3:
-            # v3: clean up duplicate trips/waypoints from earlier indexer bugs.
-            # Wrapped in a savepoint so a failure during migration doesn't leave
-            # the schema_version bumped without the data fixes applied.
-            try:
-                conn.execute("SAVEPOINT migrate_v3")
-                _migrate_v2_to_v3(conn)
-                conn.execute("RELEASE SAVEPOINT migrate_v3")
-            except Exception as e:
-                conn.execute("ROLLBACK TO SAVEPOINT migrate_v3")
-                conn.execute("RELEASE SAVEPOINT migrate_v3")
-                logger.error("Migration v2->v3 failed, leaving schema at v2: %s", e)
-                conn.commit()
-                return conn  # Skip schema_version bump so it retries next startup
-        if current > 0 and current < 4:
-            # v4: re-evaluate Sentry/Saved clips with Tesla's event.json
-            # (which has accurate GPS) instead of the prior nearest-waypoint
-            # guess. We do this by clearing their indexed_files rows so the
-            # next indexer run re-processes them through the new code path.
-            try:
-                conn.execute("SAVEPOINT migrate_v4")
-                _migrate_v3_to_v4(conn)
-                conn.execute("RELEASE SAVEPOINT migrate_v4")
-            except Exception as e:
-                conn.execute("ROLLBACK TO SAVEPOINT migrate_v4")
-                conn.execute("RELEASE SAVEPOINT migrate_v4")
-                logger.error("Migration v3->v4 failed, leaving schema at v3: %s", e)
-                conn.commit()
-                return conn
-        if current > 0 and current < 9:
-            # v9: one-shot repair pass for trips that were fragmented
-            # by the matching-SQL boundary bug fixed in this version.
-            # The bug: ``ORDER BY ABS(new_start - existing.start)`` plus
-            # the float-imprecise ``(julianday(...)-julianday(...))*86400``
-            # condition caused phantom-fragmented trips when files
-            # arrived out-of-order during indexer pauses (e.g., archive-
-            # lock starvation incident May 2026 — McDonald's drive split
-            # into 6 trips). The runtime ``_merge_adjacent_trips_for``
-            # added in this version prevents future fragmentation, but
-            # only sweeps the just-touched anchor's neighbourhood, so
-            # bad data already in the table will linger unless a future
-            # clip happens to bridge it. This one-shot global merge
-            # repairs the existing damage.
-            try:
-                conn.execute("SAVEPOINT migrate_v9")
-                merged = _merge_all_adjacent_trip_pairs(
-                    conn, _TRIP_GAP_MINUTES_DEFAULT * 60,
-                )
-                conn.execute("RELEASE SAVEPOINT migrate_v9")
-                if merged:
-                    logger.info(
-                        "Migration v8->v9: merged %d phantom-fragmented "
-                        "trip pairs", merged,
-                    )
-            except Exception as e:
-                conn.execute("ROLLBACK TO SAVEPOINT migrate_v9")
-                conn.execute("RELEASE SAVEPOINT migrate_v9")
-                logger.error(
-                    "Migration v8->v9 failed, leaving schema at v8: %s", e,
-                )
-                conn.commit()
-                return conn
-        # v5: covering index ``idx_waypoints_trip_video`` for the
-        # ``/api/trips`` page-load N+1 fix. The index is created by the
-        # ``executescript(_SCHEMA_SQL)`` call above (CREATE INDEX IF NOT
-        # EXISTS), so no separate data migration is needed — the schema
-        # version bump is the trigger.
-        # v6: ``indexing_queue`` table for the queue-based indexer
-        # redesign. Created by the executescript call; no data migration
-        # because there's nothing in the queue on the first upgrade — the
-        # boot catch-up scan will repopulate from indexed_files diff.
-        # v7: ``idx_trips_start_time`` for callers that range-scan
-        # by ``start_time`` directly (e.g. /api/trips with date_from
-        # bounds). Created by the executescript above.
-        # v8: expression indexes ``idx_trips_day`` and
-        # ``idx_events_day`` on ``substr(<ts>, 1, 10)`` so the day-
-        # based map queries can avoid full scans. Plain timestamp
-        # indexes do NOT cover ``substr(col, 1, 10) = ?``. The
-        # expression indexes are created by the executescript above
-        # (CREATE INDEX IF NOT EXISTS is idempotent); no data
-        # migration required.
-        conn.execute("DELETE FROM schema_version")
-        conn.execute(
-            "INSERT INTO schema_version (version) VALUES (?)",
-            (_SCHEMA_VERSION,)
-        )
-        conn.commit()
-        logger.info("Geo-index database initialized (v%d) at %s", _SCHEMA_VERSION, db_path)
-
-    return conn
-
-
-# ---------------------------------------------------------------------------
-# Migrations
-# ---------------------------------------------------------------------------
-
-def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
-    """Clean up duplicate trips and waypoints from earlier indexer bugs.
-
-    Earlier versions of the indexer:
-      * Created separate trips for the same physical drive when the videos
-        were ingested from different source folders (RecentClips vs ArchivedClips).
-      * Stored duplicate waypoints with the same ``(timestamp, lat, lon)`` but
-        different ``video_path`` strings (one per copy of the video).
-      * Recorded ``source_folder='..'`` for ArchivedClips because of a path
-        normalization bug.
-
-    This one-time migration:
-      1. Repairs ``source_folder='..'`` rows by inferring from waypoint paths.
-      2. Merges trips whose time windows overlap or are within
-         ``_TRIP_GAP_MINUTES_DEFAULT`` minutes of each other (regardless of
-         source_folder).
-      3. Dedupes waypoints within each trip by ``(timestamp, lat, lon)``,
-         preferring the row whose ``video_path`` references ArchivedClips
-         (most durable storage).
-      4. Recomputes ``start_time``, ``end_time``, start/end coords,
-         ``distance_km`` and ``duration_seconds`` for every trip; deletes
-         trips left with no waypoints.
-    """
-    gap_seconds = _TRIP_GAP_MINUTES_DEFAULT * 60
-    log_parts: List[str] = []
-
-    # --- Phase 1: source_folder='..' ---
-    bad = conn.execute(
-        "SELECT id FROM trips WHERE source_folder = '..' OR source_folder LIKE '..%'"
-    ).fetchall()
-    fixed_src = 0
-    for r in bad:
-        wp = conn.execute(
-            "SELECT video_path FROM waypoints "
-            "WHERE trip_id = ? AND video_path IS NOT NULL ORDER BY id LIMIT 1",
-            (r['id'],),
-        ).fetchone()
-        if wp and wp['video_path']:
-            vp = wp['video_path'].replace('\\', '/')
-            if 'ArchivedClips' in vp:
-                folder = 'ArchivedClips'
-            elif '/' in vp:
-                folder = vp.split('/')[0]
-            else:
-                folder = 'Unknown'
-            conn.execute(
-                "UPDATE trips SET source_folder = ? WHERE id = ?",
-                (folder, r['id']),
-            )
-            fixed_src += 1
-    log_parts.append(f"fixed {fixed_src} '..' source_folder rows")
-
-    # --- Phase 2: merge overlapping/close trips ---
-    # Repeatedly find any pair of trips whose windows are within gap_seconds
-    # of each other (in either direction) and merge the higher-id into the lower.
-    merged = _merge_all_adjacent_trip_pairs(conn, gap_seconds)
-    log_parts.append(f"merged {merged} overlapping trip pairs")
-
-    # --- Phase 3: dedupe waypoints within a trip ---
-    dups = conn.execute(
-        """SELECT trip_id, timestamp, lat, lon, COUNT(*) AS cnt
-           FROM waypoints
-           WHERE trip_id IS NOT NULL
-           GROUP BY trip_id, timestamp, lat, lon
-           HAVING COUNT(*) > 1"""
-    ).fetchall()
-    deduped = 0
-    for d in dups:
-        ids = conn.execute(
-            """SELECT id, video_path FROM waypoints
-               WHERE trip_id = ? AND timestamp = ? AND lat = ? AND lon = ?
-               ORDER BY
-                 CASE WHEN video_path LIKE '%ArchivedClips%' THEN 0 ELSE 1 END,
-                 id""",
-            (d['trip_id'], d['timestamp'], d['lat'], d['lon']),
-        ).fetchall()
-        # Keep the first (durable / lowest id), delete the rest
-        drop_ids = [(r['id'],) for r in ids[1:]]
-        if drop_ids:
-            conn.executemany("DELETE FROM waypoints WHERE id = ?", drop_ids)
-            deduped += len(drop_ids)
-    log_parts.append(f"deduped {deduped} duplicate waypoints")
-
-    # --- Phase 4: recompute trip stats; drop empty trips ---
-    # Distance is computed per video file (in frame/id order) and summed,
-    # because Tesla videos can overlap in time (e.g. when a saved clip is
-    # triggered alongside RecentClips). Sorting all waypoints globally by
-    # timestamp would interleave overlapping recordings and produce huge
-    # phantom jumps. start_time/end_time still come from min/max timestamp.
-    trips = conn.execute("SELECT id FROM trips").fetchall()
-    recomputed = 0
-    dropped_empty = 0
-    for t in trips:
-        bounds = conn.execute(
-            "SELECT MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts "
-            "FROM waypoints WHERE trip_id = ?",
-            (t['id'],),
-        ).fetchone()
-        if not bounds or not bounds['first_ts']:
-            conn.execute("DELETE FROM trips WHERE id = ?", (t['id'],))
-            dropped_empty += 1
-            continue
-        first_ts, last_ts = bounds['first_ts'], bounds['last_ts']
-        first_row = conn.execute(
-            "SELECT lat, lon FROM waypoints WHERE trip_id = ? "
-            "AND timestamp = ? ORDER BY id LIMIT 1",
-            (t['id'], first_ts),
-        ).fetchone()
-        last_row = conn.execute(
-            "SELECT lat, lon FROM waypoints WHERE trip_id = ? "
-            "AND timestamp = ? ORDER BY id DESC LIMIT 1",
-            (t['id'], last_ts),
-        ).fetchone()
-        # Distance summed per video file
-        total_dist = 0.0
-        videos = conn.execute(
-            "SELECT DISTINCT video_path FROM waypoints "
-            "WHERE trip_id = ? AND video_path IS NOT NULL",
-            (t['id'],),
-        ).fetchall()
-        for v in videos:
-            wps = conn.execute(
-                "SELECT lat, lon FROM waypoints "
-                "WHERE trip_id = ? AND video_path = ? ORDER BY id",
-                (t['id'], v['video_path']),
-            ).fetchall()
-            for j in range(1, len(wps)):
-                total_dist += _haversine_km(
-                    wps[j-1]['lat'], wps[j-1]['lon'],
-                    wps[j]['lat'], wps[j]['lon'],
-                )
-        try:
-            dur = max(0, int((
-                datetime.fromisoformat(last_ts)
-                - datetime.fromisoformat(first_ts)
-            ).total_seconds()))
-        except (ValueError, TypeError):
-            dur = 0
-        conn.execute(
-            """UPDATE trips SET
-               start_time = ?, end_time = ?,
-               start_lat = ?, start_lon = ?,
-               end_lat = ?, end_lon = ?,
-               distance_km = ?, duration_seconds = ?
-               WHERE id = ?""",
-            (first_ts, last_ts,
-             first_row['lat'] if first_row else None,
-             first_row['lon'] if first_row else None,
-             last_row['lat'] if last_row else None,
-             last_row['lon'] if last_row else None,
-             total_dist, dur, t['id']),
-        )
-        recomputed += 1
-    log_parts.append(
-        f"recomputed stats for {recomputed} trips; dropped {dropped_empty} empty"
-    )
-
-    logger.info("Migration v2->v3: %s", "; ".join(log_parts))
+#
+# The schema DDL, version constants, backup helper, ``_init_db`` connection
+# factory, and the v2/v3/v4 migrations now live in
+# ``services.mapping_migrations``. ``_init_db``, ``_backup_db`` and
+# ``_SCHEMA_VERSION`` are re-exported from this module (top-level import
+# below) so the (very many) existing internal call sites and test imports
+# continue to work unchanged. New code should import from
+# ``services.mapping_migrations`` directly.
 
 
 # Default trip gap, also used by the migration. Kept here so the migration
@@ -814,51 +409,6 @@ def _merge_all_adjacent_trip_pairs(conn: sqlite3.Connection,
 # Event Detection Rules
 # ---------------------------------------------------------------------------
 
-def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
-    """Re-evaluate Sentry/Saved clips with Tesla's event.json.
-
-    Earlier versions inferred Sentry/Saved event locations from the
-    nearest waypoint, which was inaccurate (often pointed at a different
-    physical location). Tesla actually writes a precise event.json with
-    est_lat/est_lon in each event folder.
-
-    To pick this up for clips already in the database, we delete:
-      1. The existing inferred-location detected_events rows
-         (they have metadata.inferred_location=true), and
-      2. The indexed_files rows for SavedClips/SentryClips clips with
-         zero waypoints — so the next indexer run re-processes them
-         through the new event.json-aware code path.
-
-    Driving clips (those with waypoints) are left untouched.
-    """
-    # Drop old inferred events so they get recreated from event.json
-    cur = conn.execute(
-        "DELETE FROM detected_events "
-        "WHERE event_type IN ('saved', 'sentry') "
-        "AND metadata IS NOT NULL "
-        "AND (metadata LIKE '%inferred_location%' "
-        "     OR metadata LIKE '%nearest_waypoint%')"
-    )
-    deleted_events = cur.rowcount
-    logger.info("v3->v4: cleared %d stale inferred events", deleted_events)
-
-    # Clear indexed_files rows for SavedClips/SentryClips zero-waypoint
-    # entries so they get re-indexed with event.json reading
-    cur = conn.execute(
-        "DELETE FROM indexed_files "
-        "WHERE waypoint_count = 0 "
-        "AND (file_path LIKE '%/SavedClips/%' "
-        "     OR file_path LIKE '%/SentryClips/%' "
-        "     OR file_path LIKE '%\\SavedClips\\%' "
-        "     OR file_path LIKE '%\\SentryClips\\%')"
-    )
-    cleared_files = cur.rowcount
-    logger.info("v3->v4: cleared %d Sentry/Saved indexed_files entries for re-processing",
-                cleared_files)
-
-
-# ---------------------------------------------------------------------------
-
 # Default thresholds (can be overridden via config.yaml mapping.event_detection)
 DEFAULT_THRESHOLDS = {
     'harsh_brake_threshold': -4.0,        # m/s² (longitudinal)
@@ -866,7 +416,6 @@ DEFAULT_THRESHOLDS = {
     'hard_accel_threshold': 3.5,
     'sharp_turn_lateral_g': 4.0,          # m/s² (lateral)
     'speed_limit_mps': 35.76,             # ~80 mph
-    'fsd_disengage_detect': True,
 }
 
 
@@ -952,8 +501,8 @@ def _detect_events(
                 'metadata': json.dumps({'speed_mps': speed, 'limit_mps': limit}),
             })
 
-        # --- FSD Disengagement ---
-        if thresholds.get('fsd_disengage_detect', True) and prev_autopilot is not None:
+        # --- FSD Disengagement (issue #184 Wave 1: always on) ---
+        if prev_autopilot is not None:
             engaged = {'SELF_DRIVING', 'AUTOSTEER'}
             if prev_autopilot in engaged and autopilot not in engaged:
                 events.append({
@@ -1032,169 +581,10 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Polyline gap detection
+# Polyline gap detection moved to services.mapping_queries (Phase 3c.3, #100)
 # ---------------------------------------------------------------------------
 
-# A "gap" between consecutive waypoints means we should NOT draw a
-# polyline segment connecting them — the car either wasn't recording
-# (Tesla skipped clips during a parking break, or the dashcam was off)
-# or the SEI metadata is corrupted. Without gap detection, day-view and
-# All-time renderers draw a long straight diagonal across the map from
-# one side of the gap to the other (observed bug Apr 26 2026: a 5.8 km
-# straight line between two ends of a 6-minute parking break the trip
-# detector incorrectly merged into one trip).
-#
-# Two complementary thresholds, OR'd together — either alone catches
-# different real-world failure modes:
-#
-#   * MAX_GAP_SECONDS = 60 — Tesla front-camera clips are 60 s; a gap
-#     longer than that means at least one clip is missing entirely.
-#     Catches park-break gaps even when the car barely moved.
-#
-#   * MAX_GAP_METERS = 250 — Tesla SEI samples at ~1 Hz; even at 80 mph
-#     (~36 m/s) consecutive samples are <40 m apart. A jump >250 m
-#     between two adjacent waypoints is geographically impossible and
-#     usually indicates SEI clock skew across overlapping clips, dropped
-#     frames, or interleaved data from a re-indexed late-arriving clip
-#     whose timestamps disagree with the rest of the trip.
-#
-# Both numbers were chosen conservatively: real driving never trips
-# them, and any miss would be visible to the user anyway.
 
-GAP_MAX_SECONDS_DEFAULT = 60.0
-GAP_MAX_METERS_DEFAULT = 250.0
-
-
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance between two GPS points, in meters."""
-    return _haversine_km(lat1, lon1, lat2, lon2) * 1000.0
-
-
-def _parse_iso_seconds(ts: Optional[str]) -> Optional[float]:
-    """Parse an ISO-8601 timestamp to epoch seconds; ``None`` on failure.
-
-    Tolerates timezone-naive and ``Z``-suffixed forms — both are
-    produced by the indexer depending on whether the SEI carried tz.
-    """
-    if not ts:
-        return None
-    try:
-        if ts.endswith('Z'):
-            ts = ts[:-1] + '+00:00'
-        return datetime.fromisoformat(ts).timestamp()
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_gap_between(prev_ts: Optional[str], prev_lat: Optional[float],
-                    prev_lon: Optional[float], curr_ts: Optional[str],
-                    curr_lat: Optional[float], curr_lon: Optional[float],
-                    max_seconds: float = GAP_MAX_SECONDS_DEFAULT,
-                    max_meters: float = GAP_MAX_METERS_DEFAULT) -> bool:
-    """Return True iff (prev → curr) crosses a gap that should split a
-    polyline.
-
-    Either threshold is enough on its own; both are checked because
-    they catch different failure modes (see module-level constants).
-    Missing coordinates or unparseable timestamps are treated as no
-    gap on that axis — never as a positive — so a malformed waypoint
-    can't accidentally break a long continuous polyline.
-    """
-    pa = _parse_iso_seconds(prev_ts)
-    pb = _parse_iso_seconds(curr_ts)
-    if pa is not None and pb is not None and abs(pb - pa) > max_seconds:
-        return True
-    if (prev_lat is not None and prev_lon is not None
-            and curr_lat is not None and curr_lon is not None):
-        if _haversine_m(prev_lat, prev_lon, curr_lat, curr_lon) > max_meters:
-            return True
-    return False
-
-
-def _simplify_polyline_rdp(latlons, epsilon_m: float = 8.0) -> List[int]:
-    """Apply Ramer-Douglas-Peucker simplification to a (lat, lon)
-    polyline, returning the indices of the points to keep.
-
-    The algorithm projects (lat, lon) to a local equirectangular
-    meters frame centered on the polyline's mean latitude, then
-    keeps every point whose perpendicular distance to the
-    simplified line exceeds ``epsilon_m``. This preserves road
-    corners (their perpendicular distance to a chord across them
-    is large) and collapses straight stretches (zero perpendicular
-    distance). 8 m is the default because it sits comfortably above
-    typical Tesla GPS noise (~3-5 m) yet is tight enough that any
-    visible road feature survives at any zoom relevant to the All
-    time map view.
-
-    Iterative (stack-based) to avoid Python's default recursion
-    limit on multi-thousand-point trips. Always returns at minimum
-    ``[0, n-1]`` (the endpoints) for any polyline of length >= 2;
-    for ``n < 2`` returns ``list(range(n))``.
-
-    Used by :func:`query_all_routes_simplified` to fix the visible
-    "polyline cuts across the road" bug that stride sampling
-    produced on long trips with sharp turns.
-    """
-    n = len(latlons)
-    if n < 3:
-        return list(range(n))
-
-    # Project (lat, lon) to local meters via equirectangular
-    # approximation centered on the polyline's mean latitude.
-    # Plenty accurate for trips up to ~100 km — we'll never see
-    # longer in a single Tesla trip recording.
-    mean_lat = sum(p[0] for p in latlons) / n
-    cos_lat = math.cos(math.radians(mean_lat))
-    deg_lat_m = 111320.0  # ~ meters per degree of latitude
-    deg_lon_m = deg_lat_m * cos_lat
-    xy = [(p[1] * deg_lon_m, p[0] * deg_lat_m) for p in latlons]
-
-    keep = [False] * n
-    keep[0] = True
-    keep[-1] = True
-    eps2 = epsilon_m * epsilon_m
-    stack = [(0, n - 1)]
-    while stack:
-        start, end = stack.pop()
-        if end <= start + 1:
-            continue
-        x1, y1 = xy[start]
-        x2, y2 = xy[end]
-        dx = x2 - x1
-        dy = y2 - y1
-        denom = dx * dx + dy * dy
-        max_d2 = 0.0
-        max_i = start
-        if denom == 0.0:
-            # Degenerate segment (start point == end point — happens
-            # for loop trips that finish where they started). Use
-            # plain euclidean distance to the start so we still find
-            # the farthest excursion and split there.
-            for i in range(start + 1, end):
-                xi, yi = xy[i]
-                ddx = xi - x1
-                ddy = yi - y1
-                d2 = ddx * ddx + ddy * ddy
-                if d2 > max_d2:
-                    max_d2 = d2
-                    max_i = i
-        else:
-            for i in range(start + 1, end):
-                xi, yi = xy[i]
-                # Squared perpendicular distance from (xi, yi) to
-                # the line through (x1, y1) and (x2, y2). Computing
-                # d^2 instead of d skips a per-point sqrt — we only
-                # need to compare against eps^2.
-                num = dy * xi - dx * yi + x2 * y1 - y2 * x1
-                d2 = (num * num) / denom
-                if d2 > max_d2:
-                    max_d2 = d2
-                    max_i = i
-        if max_d2 > eps2:
-            keep[max_i] = True
-            stack.append((start, max_i))
-            stack.append((max_i, end))
-    return [i for i, k in enumerate(keep) if k]
 
 
 # ---------------------------------------------------------------------------
@@ -1252,10 +642,16 @@ def _get_worker_status_for_stats() -> dict:
 
 
 def _timestamp_from_filename(filename: str) -> Optional[str]:
-    """Extract ISO timestamp from Tesla video filename.
+    """Extract ISO timestamp from a Tesla video filename.
 
-    Tesla format: YYYY-MM-DD_HH-MM-SS-camera.mp4
-    Returns ISO format: YYYY-MM-DDTHH:MM:SS
+    Tesla format: ``YYYY-MM-DD_HH-MM-SS-camera.mp4``. The embedded
+    timestamp is the car's onboard local clock at the moment Tesla
+    began the recording — **not** UTC, and **not** guaranteed correct
+    (Tesla's clock can drift by hours/days when GPS sync is lost).
+
+    Use ``_resolve_recording_time`` instead for a value you can trust;
+    this helper exists only as the fallback when the MP4 ``mvhd`` atom
+    cannot be read.
     """
     base = os.path.basename(filename)
     # Extract the timestamp portion (first 19 chars: YYYY-MM-DD_HH-MM-SS)
@@ -1267,6 +663,114 @@ def _timestamp_from_filename(filename: str) -> Optional[str]:
         except ValueError:
             pass
     return None
+
+
+# Threshold for "Tesla onboard clock disagrees with mvhd UTC by more than
+# this many seconds" — when crossed we log a WARNING so operators can spot
+# Tesla clock-glitch incidents in the journal. The indexer always trusts
+# mvhd regardless of the gap; the threshold only controls log verbosity.
+_CLOCK_SKEW_WARN_SECONDS = 300
+
+
+def _resolve_recording_time(
+    video_path: str,
+    sidecar=None,
+) -> Optional[str]:
+    """Return the authoritative ISO start-of-recording timestamp for a clip.
+
+    Strategy (in priority order):
+
+    1. **MP4 ``mvhd`` atom (UTC, GPS-derived).** Tesla writes the
+       per-recording start time into the standard MP4 ``mvhd``
+       creation_time field in proper UTC, populated from the GPS
+       satellite clock — this is independent of the car's onboard
+       local clock. When Tesla's onboard clock has glitched (e.g.
+       lost GPS time sync after a firmware update), the filename
+       embeds the wrong local time but ``mvhd`` remains correct.
+       Converted to naive local time so the rest of the pipeline
+       (which has historically stored naive local strings) sees no
+       semantic change.
+
+    2. **Filename fallback.** Older firmware / corrupt MP4 / files
+       Tesla never finished writing may lack a usable ``mvhd``. In
+       that case fall back to the filename — same as the legacy
+       behaviour. We log nothing here because it's the expected
+       behaviour for partial / broken clips.
+
+    Logs a WARNING when both sources are available and disagree by
+    more than ``_CLOCK_SKEW_WARN_SECONDS`` (default 5 minutes), since
+    that pattern indicates a Tesla onboard-clock glitch worth knowing
+    about. The indexer always uses the mvhd value regardless of gap
+    size — mvhd is the truth.
+
+    ``sidecar`` is an optional pre-loaded ``SeiSidecar`` from
+    ``read_sei_sidecar``. When provided, we use its cached
+    ``mvhd_creation_time_utc`` and skip ALL parser I/O. Pass it from
+    callers (e.g. ``_index_video``) that are already going to read
+    the sidecar themselves — it eliminates the duplicate sidecar
+    JSON read that issue #197's review flagged. mvhd is
+    sample-rate-independent so the caller MAY pass a sidecar even if
+    its ``sample_rate`` doesn't match the indexer's request.
+    """
+    filename_ts = _timestamp_from_filename(video_path)
+    parser = _get_sei_parser()
+    mvhd_dt: Optional[datetime] = None
+    # Issue #197: prefer the sidecar's cached mvhd if present —
+    # avoids one full mmap walk of the .mp4. The sidecar is
+    # written by archive_worker right after _atomic_copy while
+    # the file's pages are still hot in the page cache; reading
+    # it back is a 5-50 KB JSON load instead of a 30-80 MB mmap.
+    # Caller may have already loaded the sidecar (via
+    # ``read_sei_sidecar``) and passed it in to avoid a second
+    # JSON read on the same file.
+    if sidecar is None and hasattr(parser, 'read_sei_sidecar'):
+        try:
+            sidecar = parser.read_sei_sidecar(video_path)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "sidecar read failed for %s (%s); "
+                "falling back to mmap mvhd parse",
+                video_path, e,
+            )
+            sidecar = None
+    if sidecar is not None and sidecar.mvhd_creation_time_utc is not None:
+        mvhd_dt = sidecar.mvhd_creation_time_utc
+    else:
+        try:
+            mvhd_dt = parser.extract_mvhd_creation_time(video_path)
+        except Exception as e:  # defensive: mvhd reader is best-effort
+            logger.debug("mvhd read failed for %s: %s", video_path, e)
+            mvhd_dt = None
+
+    if mvhd_dt is None:
+        return filename_ts
+
+    # Convert UTC -> naive local. ``datetime.fromtimestamp`` (no tz arg)
+    # uses the system local TZ; mirroring how _timestamp_from_filename
+    # produces a naive value Tesla wrote in the car's local clock.
+    try:
+        local_naive = datetime.fromtimestamp(mvhd_dt.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return filename_ts
+
+    if filename_ts:
+        try:
+            filename_dt = datetime.fromisoformat(filename_ts)
+            skew = abs((filename_dt - local_naive).total_seconds())
+            if skew >= _CLOCK_SKEW_WARN_SECONDS:
+                logger.warning(
+                    "Tesla onboard-clock skew detected for %s: filename "
+                    "says %s, mvhd UTC says %s (delta %.0fs); using mvhd. "
+                    "This typically indicates the car lost GPS time sync.",
+                    os.path.basename(video_path),
+                    filename_ts,
+                    local_naive.isoformat(),
+                    skew,
+                )
+        except (ValueError, TypeError):
+            pass
+
+    return local_naive.isoformat()
 
 
 def canonical_key(video_path: str) -> str:
@@ -1333,576 +837,71 @@ def candidate_db_paths(canonical_key_value: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Indexing queue API (services.indexing_worker is the consumer)
+# Indexing queue API moved to services.indexing_queue_service (Phase 3c.1).
 # ---------------------------------------------------------------------------
 
-# Priority is "lower wins". Defaults reflect the plan's user-experience
-# ordering: event clips first (user wants to see the incident), then
-# archived trips (already on local SD, won't disappear), then recent
-# clips (least urgent — Tesla's circular buffer will overwrite them
-# eventually but the watcher catches them in real time).
-_PRIORITY_SENTRY_SAVED = 10
-_PRIORITY_ARCHIVE = 20
-_PRIORITY_RECENT = 30
-_PRIORITY_DEFAULT = 50
-
-# Worker tuning — kept module-level so tests can monkeypatch them.
-_PARSE_ERROR_MAX_ATTEMPTS = 3
-_PARSE_ERROR_BASE_BACKOFF = 60.0
-_PARSE_ERROR_MAX_BACKOFF = 3600.0
-# Rows whose claim is older than this are considered orphaned (worker
-# crashed mid-file) and can be released for re-attempt.
-_STALE_CLAIM_SECONDS = 1800.0
-# Sentinel: permanently failed rows are deferred this far into the
-# future. Surfaces them in dead-letter queries via attempts column.
-_DEAD_LETTER_DEFER_SECONDS = 365 * 24 * 3600.0
-
-
-def priority_for_path(file_path: str) -> int:
-    """Map a clip path to its indexing-queue priority.
-
-    Uses the same folder-name heuristic as ``canonical_key`` so the
-    classification is consistent across producers (watcher, archive,
-    catch-up) and the worker.
-    """
-    norm = (file_path or '').replace('\\', '/').lower()
-    if '/savedclips/' in norm or '/sentryclips/' in norm:
-        return _PRIORITY_SENTRY_SAVED
-    if '/archivedclips/' in norm:
-        return _PRIORITY_ARCHIVE
-    if '/recentclips/' in norm:
-        return _PRIORITY_RECENT
-    return _PRIORITY_DEFAULT
-
-
-def _open_queue_conn(db_path: str) -> sqlite3.Connection:
-    """Open a tuned SQLite connection for queue ops.
-
-    Mirrors the per-connection settings used by ``_init_db`` so writers
-    don't trip over contended locks. Caller owns close.
-    """
-    conn = sqlite3.connect(db_path, timeout=15.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 15000")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    return conn
-
-
-def enqueue_for_indexing(db_path: str, file_path: str, *,
-                         priority: Optional[int] = None,
-                         source: str = 'manual',
-                         next_attempt_at: Optional[float] = None) -> bool:
-    """Add or upgrade a single file in the indexing queue.
-
-    Returns True if a row was inserted or updated, False if the file
-    was rejected (path empty, canonical_key empty). Idempotent — a
-    second enqueue of the same canonical_key only lowers the priority
-    if the new value is more urgent.
-
-    ``next_attempt_at`` lets producers defer the first claim atomically
-    with the insert. The archive flow uses this to give the inline
-    indexer a head start so the worker doesn't race the inline call
-    and clobber a fresh claim. Only applied on INSERT — an existing
-    row already has its own schedule that we should respect.
-
-    Safe to call from any producer (watcher, archive, manual button).
-    Never blocks the caller for I/O — the actual parse happens in the
-    worker thread.
-    """
-    if not file_path:
-        return False
-    key = canonical_key(file_path)
-    if not key:
-        return False
-    if priority is None:
-        priority = priority_for_path(file_path)
-    now = time.time()
-    next_at = float(next_attempt_at) if next_attempt_at is not None else 0.0
-    try:
-        with _open_queue_conn(db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO indexing_queue
-                    (canonical_key, file_path, priority,
-                     enqueued_at, next_attempt_at, source)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(canonical_key) DO UPDATE SET
-                    priority = MIN(priority, excluded.priority),
-                    file_path = CASE
-                        WHEN claimed_by IS NULL
-                            THEN excluded.file_path
-                        ELSE file_path
-                    END,
-                    source = CASE
-                        WHEN claimed_by IS NULL
-                            THEN excluded.source
-                        ELSE source
-                    END
-                """,
-                (key, file_path, priority, now, next_at, source),
-            )
-        return True
-    except sqlite3.Error as e:
-        logger.warning("enqueue_for_indexing failed for %s: %s", file_path, e)
-        return False
-
-
-def enqueue_many_for_indexing(db_path: str,
-                              items: List[Tuple[str, Optional[int]]],
-                              source: str = 'catchup') -> int:
-    """Batch enqueue. ``items`` is a list of ``(file_path, priority)``.
-
-    A None priority means "use ``priority_for_path``". Returns the
-    number of items that were actually written (skipping empty paths).
-    Single transaction so a 200-orphan boot catch-up costs ~10 ms.
-    """
-    if not items:
-        return 0
-    now = time.time()
-    rows: List[Tuple[str, str, int, float, str]] = []
-    for file_path, prio in items:
-        if not file_path:
-            continue
-        key = canonical_key(file_path)
-        if not key:
-            continue
-        if prio is None:
-            prio = priority_for_path(file_path)
-        rows.append((key, file_path, prio, now, source))
-    if not rows:
-        return 0
-    try:
-        with _open_queue_conn(db_path) as conn:
-            conn.executemany(
-                """
-                INSERT INTO indexing_queue
-                    (canonical_key, file_path, priority,
-                     enqueued_at, next_attempt_at, source)
-                VALUES (?, ?, ?, ?, 0, ?)
-                ON CONFLICT(canonical_key) DO UPDATE SET
-                    priority = MIN(priority, excluded.priority),
-                    file_path = CASE
-                        WHEN claimed_by IS NULL
-                            THEN excluded.file_path
-                        ELSE file_path
-                    END,
-                    source = CASE
-                        WHEN claimed_by IS NULL
-                            THEN excluded.source
-                        ELSE source
-                    END
-                """,
-                rows,
-            )
-        return len(rows)
-    except sqlite3.Error as e:
-        logger.warning("enqueue_many_for_indexing failed: %s", e)
-        return 0
-
-
-def recover_stale_claims(db_path: str,
-                         max_age_seconds: float = _STALE_CLAIM_SECONDS) -> int:
-    """Release claims older than ``max_age_seconds``.
-
-    Called once at worker startup so a previous crash can't permanently
-    lock a row. Returns the number of claims released.
-    """
-    cutoff = time.time() - max_age_seconds
-    try:
-        with _open_queue_conn(db_path) as conn:
-            cur = conn.execute(
-                """
-                UPDATE indexing_queue
-                   SET claimed_by = NULL, claimed_at = NULL
-                 WHERE claimed_by IS NOT NULL
-                   AND claimed_at < ?
-                """,
-                (cutoff,),
-            )
-            released = cur.rowcount or 0
-        if released:
-            logger.warning(
-                "Released %d stale indexing claims (>%ds old)",
-                released, int(max_age_seconds),
-            )
-        return released
-    except sqlite3.Error as e:
-        logger.warning("recover_stale_claims failed: %s", e)
-        return 0
-
-
-def claim_next_queue_item(db_path: str,
-                          worker_id: str) -> Optional[Dict[str, Any]]:
-    """Atomically claim the next ready, highest-priority queue item.
-
-    Returns a dict with the row's columns, or None if nothing is ready.
-    Uses ``BEGIN IMMEDIATE`` so two workers (or worker + archive inline
-    indexer) can never see the same canonical_key.
-
-    The returned dict includes ``claimed_by`` and ``claimed_at`` (the
-    timestamp at which we claimed). Pass these back to
-    ``complete_queue_item`` / ``release_claim`` / ``defer_queue_item``
-    as ``claimed_by=`` and ``claimed_at=`` so a stale worker can never
-    mutate a row a fresh worker has re-claimed.
-
-    "Ready" = ``claimed_by IS NULL AND next_attempt_at <= now()`` AND
-    ``attempts < _PARSE_ERROR_MAX_ATTEMPTS`` (dead-letter rows are
-    skipped automatically).
-    """
-    now = time.time()
-    try:
-        conn = _open_queue_conn(db_path)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                """
-                SELECT canonical_key, file_path, priority, enqueued_at,
-                       next_attempt_at, attempts, last_error, source
-                  FROM indexing_queue
-                 WHERE claimed_by IS NULL
-                   AND next_attempt_at <= ?
-                   AND attempts < ?
-                 ORDER BY priority ASC, enqueued_at ASC
-                 LIMIT 1
-                """,
-                (now, _PARSE_ERROR_MAX_ATTEMPTS),
-            ).fetchone()
-            if row is None:
-                conn.execute("COMMIT")
-                return None
-            conn.execute(
-                """
-                UPDATE indexing_queue
-                   SET claimed_by = ?, claimed_at = ?
-                 WHERE canonical_key = ?
-                """,
-                (worker_id, now, row['canonical_key']),
-            )
-            conn.execute("COMMIT")
-            result = dict(row)
-            # Include the claim token so the worker can pass it back as
-            # an owner-guard for complete/release/defer.
-            result['claimed_by'] = worker_id
-            result['claimed_at'] = now
-            return result
-        except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
-            raise
-        finally:
-            conn.close()
-    except sqlite3.Error as e:
-        logger.warning("claim_next_queue_item failed: %s", e)
-        return None
-
-
-def complete_queue_item(db_path: str, canonical_key_value: str,
-                        *, claimed_by: Optional[str] = None,
-                        claimed_at: Optional[float] = None) -> bool:
-    """Remove a row after a terminal-outcome processing.
-
-    Used for INDEXED, ALREADY_INDEXED, DUPLICATE_UPGRADED,
-    NO_GPS_RECORDED, NOT_FRONT_CAMERA, FILE_MISSING. Returns True if a
-    row was deleted.
-
-    If ``claimed_by`` and ``claimed_at`` are provided, the delete is
-    guarded so it only takes effect if the row is still owned by the
-    same claim. This prevents a stuck/timed-out worker from deleting a
-    row that's been re-claimed by a fresh worker. Pass them whenever
-    you have them (the worker always does); omit only for catch-up /
-    one-shot scripts that don't claim.
-    """
-    if not canonical_key_value:
-        return False
-    try:
-        with _open_queue_conn(db_path) as conn:
-            if claimed_by is None:
-                cur = conn.execute(
-                    "DELETE FROM indexing_queue WHERE canonical_key = ?",
-                    (canonical_key_value,),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    DELETE FROM indexing_queue
-                     WHERE canonical_key = ?
-                       AND claimed_by = ?
-                       AND claimed_at = ?
-                    """,
-                    (canonical_key_value, claimed_by, claimed_at),
-                )
-            return (cur.rowcount or 0) > 0
-    except sqlite3.Error as e:
-        logger.warning(
-            "complete_queue_item failed for %s: %s",
-            canonical_key_value, e,
-        )
-        return False
-
-
-def release_claim(db_path: str, canonical_key_value: str,
-                  *, claimed_by: Optional[str] = None,
-                  claimed_at: Optional[float] = None) -> bool:
-    """Release a claim without progressing the row.
-
-    Used for transient failures (DB_BUSY, worker pause/resume) where
-    we want another tick — or another worker — to retry without
-    incrementing ``attempts``.
-
-    If ``claimed_by`` and ``claimed_at`` are provided, the release is
-    guarded so a stale worker can't accidentally release a row
-    re-claimed by a fresh worker.
-    """
-    if not canonical_key_value:
-        return False
-    try:
-        with _open_queue_conn(db_path) as conn:
-            if claimed_by is None:
-                cur = conn.execute(
-                    """
-                    UPDATE indexing_queue
-                       SET claimed_by = NULL, claimed_at = NULL
-                     WHERE canonical_key = ?
-                    """,
-                    (canonical_key_value,),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE indexing_queue
-                       SET claimed_by = NULL, claimed_at = NULL
-                     WHERE canonical_key = ?
-                       AND claimed_by = ?
-                       AND claimed_at = ?
-                    """,
-                    (canonical_key_value, claimed_by, claimed_at),
-                )
-            return (cur.rowcount or 0) > 0
-    except sqlite3.Error as e:
-        logger.warning(
-            "release_claim failed for %s: %s",
-            canonical_key_value, e,
-        )
-        return False
-
-
-def defer_queue_item(db_path: str, canonical_key_value: str,
-                     next_attempt_at: float, *,
-                     bump_attempts: bool = False,
-                     last_error: Optional[str] = None,
-                     claimed_by: Optional[str] = None,
-                     claimed_at: Optional[float] = None) -> bool:
-    """Re-schedule a row for a later attempt.
-
-    ``bump_attempts=False`` for TOO_NEW (we know exactly when the file
-    will be old enough to parse — no failure occurred).
-    ``bump_attempts=True`` for PARSE_ERROR with an exponential backoff
-    computed by the caller.
-
-    Always releases the claim so the next call to ``claim_next_queue_item``
-    can re-pick the row when ``next_attempt_at`` is reached.
-
-    If ``claimed_by`` and ``claimed_at`` are provided, the update is
-    guarded — a stale worker can't move the goalposts on a row that's
-    been re-claimed and possibly already finished.
-    """
-    if not canonical_key_value:
-        return False
-    try:
-        with _open_queue_conn(db_path) as conn:
-            params: tuple
-            if bump_attempts:
-                set_clause = (
-                    "claimed_by = NULL, claimed_at = NULL, "
-                    "next_attempt_at = ?, "
-                    "attempts = attempts + 1, "
-                    "last_error = ?"
-                )
-            else:
-                set_clause = (
-                    "claimed_by = NULL, claimed_at = NULL, "
-                    "next_attempt_at = ?, "
-                    "last_error = ?"
-                )
-            if claimed_by is None:
-                cur = conn.execute(
-                    f"UPDATE indexing_queue SET {set_clause} "
-                    f"WHERE canonical_key = ?",
-                    (next_attempt_at, last_error, canonical_key_value),
-                )
-            else:
-                cur = conn.execute(
-                    f"UPDATE indexing_queue SET {set_clause} "
-                    f"WHERE canonical_key = ? "
-                    f"  AND claimed_by = ? "
-                    f"  AND claimed_at = ?",
-                    (next_attempt_at, last_error, canonical_key_value,
-                     claimed_by, claimed_at),
-                )
-        if cur.rowcount == 0:
-            # Owner-guarded miss: row was re-claimed by another worker
-            # (or the row was deleted out from under us). Surface this
-            # so the caller logs / metrics catch it instead of silently
-            # masking a stale-claim bug.
-            if claimed_by is not None:
-                logger.warning(
-                    "defer_queue_item: owner-guard miss for %s "
-                    "(claimed_by=%s) — row re-claimed or deleted",
-                    canonical_key_value, claimed_by,
-                )
-            return False
-        return True
-    except sqlite3.Error as e:
-        logger.warning(
-            "defer_queue_item failed for %s: %s",
-            canonical_key_value, e,
-        )
-        return False
-
-
-def compute_backoff(attempts: int) -> float:
-    """Exponential backoff with cap. Pure function — easy to unit test.
-
-    ``attempts`` is the *failure count BEFORE this one* (so the first
-    retry waits ``BASE``, the second waits ``2*BASE``, etc.).
-    """
-    if attempts < 0:
-        attempts = 0
-    delay = _PARSE_ERROR_BASE_BACKOFF * (2 ** attempts)
-    return min(delay, _PARSE_ERROR_MAX_BACKOFF)
-
-
-def get_queue_status(db_path: str) -> Dict[str, Any]:
-    """Snapshot of queue health for the /api/index/status endpoint.
-
-    Returns ``{queue_depth, claimed_count, dead_letter_count,
-    next_ready_at, last_error}``. Cheap (single SQL with aggregates).
-    """
-    try:
-        with _open_queue_conn(db_path) as conn:
-            row = conn.execute(
-                """
-                SELECT
-                    SUM(CASE WHEN claimed_by IS NULL
-                              AND attempts < ?
-                             THEN 1 ELSE 0 END) AS queue_depth,
-                    SUM(CASE WHEN claimed_by IS NOT NULL
-                             THEN 1 ELSE 0 END) AS claimed_count,
-                    SUM(CASE WHEN attempts >= ?
-                             THEN 1 ELSE 0 END) AS dead_letter_count,
-                    MIN(CASE WHEN claimed_by IS NULL
-                              AND attempts < ?
-                             THEN next_attempt_at END) AS next_ready_at
-                  FROM indexing_queue
-                """,
-                (_PARSE_ERROR_MAX_ATTEMPTS,
-                 _PARSE_ERROR_MAX_ATTEMPTS,
-                 _PARSE_ERROR_MAX_ATTEMPTS),
-            ).fetchone()
-        return {
-            'queue_depth': int(row['queue_depth'] or 0),
-            'claimed_count': int(row['claimed_count'] or 0),
-            'dead_letter_count': int(row['dead_letter_count'] or 0),
-            'next_ready_at': float(row['next_ready_at'])
-                              if row['next_ready_at'] is not None else None,
-        }
-    except sqlite3.Error as e:
-        logger.warning("get_queue_status failed: %s", e)
-        return {
-            'queue_depth': 0,
-            'claimed_count': 0,
-            'dead_letter_count': 0,
-            'next_ready_at': None,
-            'error': str(e),
-        }
-
-
-def clear_pending_queue(db_path: str) -> int:
-    """Remove only **unclaimed** rows from the indexing queue.
-
-    Used by ``/api/index/cancel`` so the currently-claimed file (if
-    any) is allowed to finish — its claim row stays in the table until
-    the worker's owner-guarded delete on completion. Returns the count
-    of rows actually removed.
-    """
-    try:
-        with _open_queue_conn(db_path) as conn:
-            cur = conn.execute(
-                "DELETE FROM indexing_queue WHERE claimed_by IS NULL"
-            )
-            return cur.rowcount or 0
-    except sqlite3.Error as e:
-        logger.warning("clear_pending_queue failed: %s", e)
-        return 0
-
-
-def clear_all_queue(db_path: str) -> int:
-    """Remove every row from the indexing queue, including claimed ones.
-
-    Used by the manual "Rebuild map index (advanced)" action **after**
-    the worker has been paused — otherwise the worker may be mid-INSERT
-    into waypoints/detected_events for a row this delete would erase
-    out from under it. Callers MUST pause the worker first. Returns
-    count of rows removed.
-    """
-    try:
-        with _open_queue_conn(db_path) as conn:
-            cur = conn.execute("DELETE FROM indexing_queue")
-            return cur.rowcount or 0
-    except sqlite3.Error as e:
-        logger.warning("clear_all_queue failed: %s", e)
-        return 0
-
-
-# Backward-compat alias — same dangerous semantics as the original
-# (deletes claimed rows). New code should pick one of the two above.
-clear_queue = clear_all_queue
 
 
 def _refresh_ro_mount(teslacam_path: str) -> None:
-    """Cycle the read-only mount to refresh exFAT filesystem cache.
+    """Invalidate the VFS slab cache so ``readdir`` sees Tesla's latest
+    writes via the gadget LUN.
 
-    When in present mode, Tesla writes to the USB image through the gadget
-    while the Pi has a read-only mount of the same image.  exFAT caches
-    directory entries and won't see new/changed files until the mount is
-    refreshed.  A quick umount + mount cycle (~200ms) fixes this.
+    Tesla writes to the USB image through the gadget while the Pi has a
+    read-only mount of the same image; the kernel's dentry + inode cache
+    on the Pi side hides those new files from ``readdir`` until evicted.
+
+    This used to ``umount + mount -o ro`` the RO mount to force the
+    eviction (issue #127) — but per ``.github/copilot-instructions.md``
+    that's forbidden: any disruption of the present-mode RO mount can
+    race with Tesla's gadget reads and produce a transient I/O error,
+    losing footage if Tesla is actively recording.
+
+    The kernel-supported replacement is ``echo 2 > /proc/sys/vm/drop_caches``
+    (slabs only — dentry + inode cache). It is sub-10ms, idempotent, and
+    does NOT touch the mount, loop device, image file, or gadget
+    binding. After the slab eviction, the next ``open`` / ``readdir``
+    re-resolves through the loop device and sees Tesla's freshly-written
+    metadata.
+
+    The ``current_mode() != 'present'`` early return is preserved: in
+    edit mode the local mount IS the write path, so the cache is fresh
+    by definition and the call is a no-op.
+
+    .. note::
+
+        ``teslacam_path`` is retained as a parameter for API
+        compatibility with the legacy mount-specific implementation
+        and to document caller intent (which mount is being
+        refreshed). It is intentionally unreferenced — ``drop_caches``
+        is a process-global kernel knob that flushes caches for ALL
+        mounts on the system. This is harmless (only the RO gadget
+        mount actually has stale dentry entries; other mounts are
+        re-resolved from disk on next access at negligible cost).
     """
+    del teslacam_path  # unused — kept for API compat; see docstring
     from services.mode_service import current_mode
     if current_mode() != 'present':
-        return  # Only needed in present mode
-
-    mount_point = os.path.dirname(teslacam_path)  # e.g. /mnt/gadget/part1-ro
-    if not os.path.ismount(mount_point):
-        return
+        return  # Only meaningful in present mode
 
     try:
-        # Find the loop device backing this mount
-        result = subprocess.run(
-            ["sudo", "nsenter", "--mount=/proc/1/ns/mnt",
-             "findmnt", "-n", "-o", "SOURCE", mount_point],
-            capture_output=True, text=True, timeout=5,
-        )
-        source = result.stdout.strip()
-        if not source:
-            return
-
-        # Umount and remount
+        # ``sudo tee`` is the standard pattern for writing to a root-owned
+        # /proc file from an unprivileged process. ``input="2\n"`` writes
+        # exactly the byte the kernel expects (slab-only invalidation).
         subprocess.run(
-            ["sudo", "nsenter", "--mount=/proc/1/ns/mnt",
-             "umount", mount_point],
-            capture_output=True, timeout=10,
+            ["sudo", "tee", "/proc/sys/vm/drop_caches"],
+            input="2\n",
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=True,
         )
-        subprocess.run(
-            ["sudo", "nsenter", "--mount=/proc/1/ns/mnt",
-             "mount", "-o", "ro", source, mount_point],
-            capture_output=True, timeout=10,
-        )
-        logger.info("Refreshed RO mount at %s", mount_point)
-    except Exception as e:
-        logger.warning("Failed to refresh RO mount (non-fatal): %s", e)
+        logger.debug("VFS cache refreshed (drop_caches=2)")
+    except Exception as e:  # noqa: BLE001
+        # Non-fatal — worst case is the next read path doesn't see Tesla's
+        # most recent files until the kernel evicts the cache on its own
+        # (memory pressure or normal LRU). All callers are read-only
+        # consumers that retry on the next worker tick.
+        logger.warning("VFS cache refresh failed (non-fatal): %s", e)
 
 
 def _find_front_camera_videos(teslacam_path: str) -> Generator[str, None, None]:
@@ -1917,6 +916,15 @@ def _find_front_camera_videos(teslacam_path: str) -> Generator[str, None, None]:
       2. SavedClips and SentryClips event subfolders — user-marked clips.
       3. RecentClips — the rolling buffer. Most files written while parked
          (sentry mode) contain no GPS at all, so we process these last.
+
+    .. note::
+
+        After issue #76 Phase 2b the **indexer** no longer walks the RO
+        USB mount: ``boot_catchup_scan`` uses
+        :func:`_find_archived_videos` (ArchivedClips-only). This helper
+        is kept intact for the diagnostics endpoint
+        (``mapping_diagnostics_test``) and for any third-party caller
+        that wants the legacy "everything we can see" view.
     """
     seen_basenames: set = set()
 
@@ -1961,6 +969,71 @@ def _find_front_camera_videos(teslacam_path: str) -> Generator[str, None, None]:
                     yield os.path.join(folder_path, f)
         except OSError:
             pass
+
+
+def _find_archived_videos() -> Generator[str, None, None]:
+    """Yield front-camera MP4s under ``ARCHIVE_DIR`` (and event subfolders).
+
+    The Phase 2b indexer-side catch-up scanner. Walks ONLY the SD-card
+    ``ArchivedClips`` tree — never the RO USB mount. The
+    ``archive_producer`` thread (issue #76 Phase 2a) handles USB-side
+    catch-up by enqueueing into ``archive_queue``; the
+    ``archive_worker`` then copies them into ArchivedClips, where this
+    helper picks them up if the indexer happened to be down at the
+    moment of the worker's enqueue.
+
+    Yields the same flat-files-then-event-subfolders order as
+    :func:`_find_front_camera_videos`'s ArchivedClips section, plus
+    any nested SavedClips/SentryClips that an operator may have
+    rsync'd into the archive directory directly.
+    """
+    try:
+        from config import ARCHIVE_DIR, ARCHIVE_ENABLED
+    except ImportError:
+        return
+    if not ARCHIVE_ENABLED or not ARCHIVE_DIR or not os.path.isdir(ARCHIVE_DIR):
+        return
+
+    # Top-level mp4s (legacy archive layout — flat directory).
+    try:
+        for f in sorted(os.listdir(ARCHIVE_DIR)):
+            full = os.path.join(ARCHIVE_DIR, f)
+            if (
+                os.path.isfile(full)
+                and f.lower().endswith('.mp4')
+                and '-front' in f.lower()
+            ):
+                yield full
+    except OSError:
+        return
+
+    # Sub-trees for archived event clips (RecentClips/SavedClips/SentryClips
+    # mirrored under ArchivedClips by the worker's compute_dest_path).
+    for sub in ('RecentClips', 'SavedClips', 'SentryClips'):
+        sub_path = os.path.join(ARCHIVE_DIR, sub)
+        if not os.path.isdir(sub_path):
+            continue
+        try:
+            for entry in sorted(os.listdir(sub_path)):
+                entry_path = os.path.join(sub_path, entry)
+                if os.path.isfile(entry_path):
+                    if (
+                        entry.lower().endswith('.mp4')
+                        and '-front' in entry.lower()
+                    ):
+                        yield entry_path
+                    continue
+                if not os.path.isdir(entry_path):
+                    continue
+                # Event subfolder — yield its front-camera mp4s.
+                try:
+                    for f in sorted(os.listdir(entry_path)):
+                        if f.lower().endswith('.mp4') and '-front' in f.lower():
+                            yield os.path.join(entry_path, f)
+                except OSError:
+                    continue
+        except OSError:
+            continue
 
 
 def _read_event_json(rel_path: str, teslacam_root: str) -> Optional[dict]:
@@ -2154,7 +1227,33 @@ def _index_video(
             rel_path = os.path.relpath(video_path, teslacam_root)
     except ImportError:
         rel_path = os.path.relpath(video_path, teslacam_root)
-    file_timestamp = _timestamp_from_filename(video_path)
+    # Issue #197: read the sidecar exactly once — first to extract
+    # the cached mvhd (sample-rate-independent) for
+    # ``_resolve_recording_time``, then to consume the cached
+    # messages if the sample_rate matches what we want. Doing this
+    # ONCE here (instead of letting both _resolve_recording_time and
+    # the message-extraction below each fire their own
+    # ``read_sei_sidecar`` call) saves one JSON read + one ``stat``
+    # per indexed clip — the duplicate read PR #205's review
+    # flagged.
+    sidecar = None
+    if hasattr(parser, 'read_sei_sidecar'):
+        try:
+            # Don't pin to required_sample_rate yet — the mvhd
+            # branch needs the sidecar even on a sample_rate
+            # mismatch. We re-check sample_rate at the
+            # message-consumption point below.
+            sidecar = parser.read_sei_sidecar(video_path)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "sidecar read failed for %s (%s); "
+                "falling back to mmap parse", video_path, e,
+            )
+            sidecar = None
+
+    file_timestamp = _resolve_recording_time(
+        video_path, sidecar=sidecar,
+    )
 
     # --- Cross-folder dedup (fast path) ---
     # Tesla videos can exist in both RecentClips and ArchivedClips with the
@@ -2199,16 +1298,117 @@ def _index_video(
         logger.debug("Skipping %s: canonical key already indexed", rel_path)
         return IndexResult(IndexOutcome.ALREADY_INDEXED)
 
-    # Extract SEI messages
+    # --- Defense-in-depth dedup via indexed_files ---
+    # The waypoints check above misses when ``waypoints.video_path`` was
+    # set to NULL by an earlier ``purge_deleted_videos`` run (which can
+    # happen when a sibling copy of the clip was deleted from disk and
+    # the targeted-purge "surviving copy" check missed a candidate).
+    # When that gap is hit, the indexer would re-parse the clip and
+    # insert a SECOND set of waypoints + detected_events with the same
+    # SEI data, producing duplicate event pins on the map.
+    #
+    # ``indexed_files`` is the authoritative "we processed this physical
+    # file" record and is keyed on the absolute file path. If ANY row
+    # exists for this canonical key with ``waypoint_count > 0``, the
+    # clip was already indexed at some point — even if the surviving
+    # waypoint/event rows have lost their ``video_path``. Bail out
+    # rather than re-insert. We match on basename suffix because the
+    # absolute file path stored in ``indexed_files`` may differ from
+    # the current call site (e.g., archive moves change the directory)
+    # and the path separator differs by OS.
+    #
+    # Notes:
+    # * Tesla filenames contain underscores (``2025-11-08_08-15-44-front.mp4``)
+    #   which SQLite ``LIKE`` treats as a single-character wildcard. We
+    #   pass an ``ESCAPE '\\'`` clause and escape ``_``, ``%`` in the
+    #   basename so we don't over-match across distinct clips that happen
+    #   to share a similar character pattern.
+    # * The leading ``%`` prevents this query from using an index — but
+    #   ``indexed_files`` has at most one row per indexed clip (low
+    #   thousands across the lifetime of a Pi), so the full scan is
+    #   fast and runs at most once per ``_index_video`` invocation.
+    basename_only = os.path.basename(video_path)
+    if basename_only:
+        escaped = (
+            basename_only.replace('\\', '\\\\')
+                         .replace('%', '\\%')
+                         .replace('_', '\\_')
+        )
+        prior = conn.execute(
+            "SELECT 1 FROM indexed_files "
+            "WHERE file_path LIKE ? ESCAPE '\\' "
+            "AND waypoint_count > 0 LIMIT 1",
+            ('%' + escaped,)
+        ).fetchone()
+        if prior:
+            logger.debug(
+                "Skipping %s: indexed_files shows prior index "
+                "(video_path may have been NULLed by purge)",
+                rel_path,
+            )
+            return IndexResult(IndexOutcome.ALREADY_INDEXED)
+
+    # Extract SEI messages — prefer the issue #197 sidecar JSON cache
+    # over a fresh mmap walk when available. The sidecar is written by
+    # archive_worker right after _atomic_copy while the file's pages
+    # are still hot in the page cache; reading it back is a 5-50 KB
+    # JSON load instead of a 30-80 MB mmap (the .mp4 has likely been
+    # evicted from cache by the time the indexer runs minutes later).
     waypoint_dicts = []
     sei_count = 0
     no_gps_count = 0
+    # We already loaded ``sidecar`` above for _resolve_recording_time.
+    # Apply the sample_rate check here: if the cached sidecar was
+    # written at a different sampling than the indexer wants, we
+    # cannot reuse its messages — fall back to a mmap walk at the
+    # requested rate. (mvhd was sample-rate-independent so the call
+    # above was still useful.)
+    if sidecar is not None and sidecar.sample_rate != sample_rate:
+        logger.debug(
+            "sidecar sample_rate mismatch for %s "
+            "(cached %d, requested %d); using sidecar mvhd but "
+            "mmap-parsing for messages",
+            rel_path, sidecar.sample_rate, sample_rate,
+        )
+        sidecar_for_messages = None
+    else:
+        sidecar_for_messages = sidecar
+
     try:
-        for msg in parser.extract_sei_messages(video_path, sample_rate=sample_rate):
-            sei_count += 1
-            if not msg.has_gps:
-                no_gps_count += 1
-                continue
+        if sidecar_for_messages is not None:
+            logger.info(
+                "loaded sidecar parse for %s "
+                "(%d GPS messages, sample_rate=%d)",
+                rel_path,
+                len(sidecar_for_messages.messages),
+                sidecar_for_messages.sample_rate,
+            )
+            sei_count = sidecar_for_messages.sei_count
+            no_gps_count = sidecar_for_messages.no_gps_count
+            msg_iter = sidecar_for_messages.messages
+        else:
+            logger.info(
+                "parsed SEI messages for %s via mmap "
+                "(no sidecar, sample_rate=%d)",
+                rel_path, sample_rate,
+            )
+            msg_iter = parser.extract_sei_messages(
+                video_path, sample_rate=sample_rate,
+            )
+
+        for msg in msg_iter:
+            if sidecar_for_messages is None:
+                # Sidecar path already accounted for sei_count /
+                # no_gps_count + filtered out no-GPS messages, so the
+                # tally is only meaningful on the mmap fallback path.
+                sei_count += 1
+                if not msg.has_gps:
+                    no_gps_count += 1
+                    continue
+            # NOTE: sidecar_for_messages.messages is pre-filtered to
+            # GPS-bearing only (see ``write_sei_sidecar``), so the
+            # ``has_gps`` check above is redundant when
+            # ``sidecar_for_messages is not None``.
 
             # Compute absolute timestamp from file timestamp + frame offset
             if file_timestamp:
@@ -2326,23 +1526,84 @@ def _index_video(
         )
         trip_id = cursor.lastrowid
 
-    # Insert waypoints
-    conn.executemany(
-        """INSERT INTO waypoints
-           (trip_id, timestamp, lat, lon, heading, speed_mps,
-            acceleration_x, acceleration_y, acceleration_z,
-            gear, autopilot_state, steering_angle, brake_applied,
-            blinker_on_left, blinker_on_right,
-            video_path, frame_offset)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        [(trip_id, wp['timestamp'], wp['lat'], wp['lon'], wp['heading'],
-          wp['speed_mps'], wp['acceleration_x'], wp['acceleration_y'],
-          wp['acceleration_z'], wp['gear'], wp['autopilot_state'],
-          wp['steering_angle'], wp['brake_applied'],
-          wp['blinker_on_left'], wp['blinker_on_right'],
-          wp['video_path'], wp['frame_offset'])
-         for wp in waypoint_dicts]
-    )
+    # Insert waypoints — issue #184 Wave 3 — Phase D split.
+    # Hot columns go to ``waypoints``; if any cold field carries a
+    # non-default value above the sensor noise floor, the corresponding
+    # ``waypoints_cold`` row is written. Both inserts are batched
+    # (``executemany`` for hot + multi-VALUES with ``RETURNING id`` for
+    # capturing the new ids in one round trip; ``executemany`` for cold).
+    # Per-clip cost: ~30 ms for a 500-waypoint clip vs. ~250 ms for the
+    # original per-row loop (Info #2 from the PR #187 review).
+    #
+    # The "should we write a cold row" filter mirrors the v14→v15
+    # migration's WHERE clause (``_migrate_v14_to_v15``). SEI metadata
+    # always supplies a float (defaulted to 0.0 by protobuf) for the
+    # accel/steering fields and an int 0 for the booleans, so a strict
+    # "IS NOT NULL" check would inflate ``waypoints_cold`` to one row
+    # per waypoint — defeating the entire reason for the split. The
+    # threshold constants (``_COLD_ACCEL_THRESHOLD_MPS2`` etc.) are
+    # defined at module top.
+    if not waypoint_dicts:
+        hot_ids: List[int] = []
+    else:
+        hot_sql = (
+            "INSERT INTO waypoints "
+            "(trip_id, timestamp, lat, lon, heading, speed_mps, "
+            " autopilot_state, video_path, frame_offset) VALUES "
+            + ",".join(["(?, ?, ?, ?, ?, ?, ?, ?, ?)"] * len(waypoint_dicts))
+            + " RETURNING id"
+        )
+        flat_values: List[Any] = []
+        for wp in waypoint_dicts:
+            flat_values.extend((
+                trip_id, wp['timestamp'], wp['lat'], wp['lon'],
+                wp['heading'], wp['speed_mps'], wp['autopilot_state'],
+                wp['video_path'], wp['frame_offset'],
+            ))
+        hot_ids = [r[0] for r in conn.execute(hot_sql, flat_values).fetchall()]
+
+    cold_rows: List[Tuple[Any, ...]] = []
+    for wp_id, wp in zip(hot_ids, waypoint_dicts):
+        ax = wp.get('acceleration_x')
+        ay = wp.get('acceleration_y')
+        az = wp.get('acceleration_z')
+        sa = wp.get('steering_angle')
+        gear = wp.get('gear')
+        # Tolerance check against IMU noise floor — see comment on
+        # ``_COLD_ACCEL_THRESHOLD_MPS2`` for the calibration rationale.
+        gear_signal = bool(gear) and gear not in _COLD_GEAR_NO_SIGNAL
+        accel_signal = (
+            (ax is not None and abs(ax) > _COLD_ACCEL_THRESHOLD_MPS2)
+            or (ay is not None and abs(ay) > _COLD_ACCEL_THRESHOLD_MPS2)
+            or (az is not None and abs(az) > _COLD_ACCEL_THRESHOLD_MPS2)
+        )
+        steering_signal = (
+            sa is not None and abs(sa) > _COLD_STEERING_THRESHOLD_DEG
+        )
+        if (
+            accel_signal
+            or steering_signal
+            or gear_signal
+            or wp.get('brake_applied')
+            or wp.get('blinker_on_left')
+            or wp.get('blinker_on_right')
+        ):
+            cold_rows.append((
+                wp_id, ax, ay, az, gear, sa,
+                1 if wp.get('brake_applied') else 0,
+                1 if wp.get('blinker_on_left') else 0,
+                1 if wp.get('blinker_on_right') else 0,
+            ))
+
+    if cold_rows:
+        conn.executemany(
+            """INSERT OR REPLACE INTO waypoints_cold
+               (id, acceleration_x, acceleration_y, acceleration_z,
+                gear, steering_angle, brake_applied,
+                blinker_on_left, blinker_on_right)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            cold_rows,
+        )
 
     # Run event detection
     events = _detect_events(waypoint_dicts, thresholds, rel_path)
@@ -2394,22 +1655,35 @@ def _index_video(
             (trip_id, last_ts),
         ).fetchone()
         total_dist = 0.0
-        videos = conn.execute(
-            "SELECT DISTINCT video_path FROM waypoints "
-            "WHERE trip_id = ? AND video_path IS NOT NULL",
+        # Phase 5.1 (#102) — collapse the original N+1 (1 query for
+        # the distinct video list + 1 per video) into a single
+        # ORDER BY video_path, id pass.
+        #
+        # Distance is summed per video (we MUST NOT haversine across
+        # consecutive rows belonging to different videos): Tesla videos
+        # can overlap in time (saved clips alongside RecentClips), so
+        # a global ORDER BY timestamp would interleave them and produce
+        # phantom GPS jumps. Walking ORDER BY video_path, id gives the
+        # same per-video ordering the old per-video SELECT produced,
+        # and the explicit ``video_path`` column lets us reset between
+        # videos — equivalent semantics, one query instead of 1+N.
+        all_wps = conn.execute(
+            "SELECT video_path, lat, lon FROM waypoints "
+            "WHERE trip_id = ? AND video_path IS NOT NULL "
+            "ORDER BY video_path, id",
             (trip_id,),
         ).fetchall()
-        for v in videos:
-            vwps = conn.execute(
-                "SELECT lat, lon FROM waypoints "
-                "WHERE trip_id = ? AND video_path = ? ORDER BY id",
-                (trip_id, v['video_path']),
-            ).fetchall()
-            for j in range(1, len(vwps)):
+        prev = None
+        prev_video = None
+        for w in all_wps:
+            video_path = w['video_path']
+            if prev is not None and video_path == prev_video:
                 total_dist += _haversine_km(
-                    vwps[j-1]['lat'], vwps[j-1]['lon'],
-                    vwps[j]['lat'], vwps[j]['lon'],
+                    prev['lat'], prev['lon'],
+                    w['lat'], w['lon'],
                 )
+            prev = w
+            prev_video = video_path
         try:
             dur = max(0, int((
                 datetime.fromisoformat(last_ts)
@@ -2477,10 +1751,17 @@ def index_single_file(
         logger.debug("index_single_file: cannot stat %s", video_path)
         return IndexResult(IndexOutcome.FILE_MISSING)
 
-    # Skip files still being written (< 2 min old). Tesla writes the moov
-    # atom at the end of each clip, and re-indexing while writes are in
-    # progress wastes CPU and may produce truncated waypoint lists.
-    if (time.time() - stat.st_mtime) < 120:
+    # Skip files still being written (< MAPPING_INDEX_TOO_NEW_SECONDS
+    # old, default 120 s). Tesla writes the moov atom at the end of
+    # each clip, and re-indexing while writes are in progress wastes
+    # CPU and may produce truncated waypoint lists. Phase 5.9 (#102):
+    # threshold is now configurable via mapping.index_too_new_seconds
+    # in config.yaml — exposed via the Settings → Advanced sub-page.
+    try:
+        from config import MAPPING_INDEX_TOO_NEW_SECONDS as _too_new
+    except Exception:  # noqa: BLE001
+        _too_new = 120.0
+    if (time.time() - stat.st_mtime) < _too_new:
         logger.debug("index_single_file: skipping %s (still being written)", video_path)
         return IndexResult(IndexOutcome.TOO_NEW)
 
@@ -2675,6 +1956,21 @@ def purge_deleted_videos(db_path: str, teslacam_path: Optional[str] = None,
                 )
                 purged_files += cur.rowcount
 
+                # 1a) Issue #197: delete the SEI sidecar JSON if any.
+                #     The sidecar is no longer useful (the .mp4 it
+                #     describes is gone) and would otherwise become
+                #     dead weight in the directory listing. Best-
+                #     effort; failure is logged at DEBUG inside the
+                #     helper.
+                try:
+                    from services import sei_parser as _sei
+                    _sei.delete_sei_sidecar(path)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(
+                        "purge: sidecar delete failed for %s: %s",
+                        path, e,
+                    )
+
                 # 2) waypoints / detected_events: NULL out video_path
                 #    instead of deleting the row. The GPS coordinates,
                 #    speed, telemetry, and detected events are all
@@ -2707,44 +2003,91 @@ def purge_deleted_videos(db_path: str, teslacam_path: Optional[str] = None,
         elif teslacam_path:
             # Full scan mode — check every indexed file against disk.
             # Also check ArchivedClips on SD card before marking as missing.
+            #
+            # Phase 5.6 (#102): the full scan walks every row of
+            # ``indexed_files`` (often >10k rows on a busy install). The
+            # legacy implementation issued a single ``fetchall()`` and
+            # held the connection open for the entire walk. On a busy
+            # Pi Zero 2 W this blocked the indexer worker (which needs
+            # the same SQLite file) for the duration of the scan and
+            # held a process-resident list of every file_path string.
+            #
+            # We now stream in batches of ``BATCH_SIZE`` rows: each
+            # batch reads under one cursor, processes, COMMITs the
+            # path-fixup UPDATEs/DELETEs, then explicitly **yields the
+            # SQLite lock** by closing + reopening the connection
+            # between batches. The reopen is cheap (μs); the yield gap
+            # lets the indexer / archive workers acquire the write lock
+            # if they're waiting.
             try:
                 from config import ARCHIVE_DIR, ARCHIVE_ENABLED
                 archive_dir = ARCHIVE_DIR if ARCHIVE_ENABLED else None
             except ImportError:
                 archive_dir = None
 
-            rows = conn.execute(
-                "SELECT file_path FROM indexed_files"
-            ).fetchall()
-            missing = []
-            for row in rows:
-                fp = row['file_path']
-                if os.path.isfile(fp):
-                    continue
-                # Check if file exists in ArchivedClips (by filename)
-                if archive_dir and os.path.isdir(archive_dir):
-                    basename = os.path.basename(fp)
-                    archive_path = os.path.join(archive_dir, basename)
-                    if os.path.isfile(archive_path):
-                        # Update indexed path to point to archive.
-                        # If the archive path already has its own entry (from
-                        # _update_geodata_paths), just delete the stale USB entry.
-                        existing = conn.execute(
-                            "SELECT 1 FROM indexed_files WHERE file_path = ?",
-                            (archive_path,)
-                        ).fetchone()
-                        if existing:
-                            conn.execute(
-                                "DELETE FROM indexed_files WHERE file_path = ?",
-                                (fp,)
-                            )
-                        else:
-                            conn.execute(
-                                "UPDATE indexed_files SET file_path = ? WHERE file_path = ?",
-                                (archive_path, fp)
-                            )
+            BATCH_SIZE = 500
+            INTER_BATCH_SLEEP = 0.05  # 50 ms — long enough to release
+                                      # the SQLite lock to a contender
+            last_rowid = 0
+            missing: List[str] = []
+            while True:
+                # Fetch one bounded batch using a rowid cursor so
+                # mid-walk DELETEs (our own path-fixup or another
+                # worker's writes) don't cause us to skip rows.
+                # ``rowid`` is the implicit SQLite primary key —
+                # always indexed, no extra cost.
+                batch = conn.execute(
+                    "SELECT rowid, file_path FROM indexed_files "
+                    "WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (last_rowid, BATCH_SIZE),
+                ).fetchall()
+                if not batch:
+                    break
+
+                for row in batch:
+                    fp = row['file_path']
+                    last_rowid = row['rowid']
+                    if os.path.isfile(fp):
                         continue
-                missing.append(fp)
+                    # Check if file exists in ArchivedClips (by filename)
+                    if archive_dir and os.path.isdir(archive_dir):
+                        basename = os.path.basename(fp)
+                        archive_path = os.path.join(archive_dir, basename)
+                        if os.path.isfile(archive_path):
+                            # Update indexed path to point to archive.
+                            # If the archive path already has its own entry (from
+                            # _update_geodata_paths), just delete the stale USB entry.
+                            existing = conn.execute(
+                                "SELECT 1 FROM indexed_files WHERE file_path = ?",
+                                (archive_path,)
+                            ).fetchone()
+                            if existing:
+                                conn.execute(
+                                    "DELETE FROM indexed_files WHERE file_path = ?",
+                                    (fp,)
+                                )
+                            else:
+                                conn.execute(
+                                    "UPDATE indexed_files SET file_path = ? WHERE file_path = ?",
+                                    (archive_path, fp)
+                                )
+                            continue
+                    missing.append(fp)
+
+                # Commit any path-fixup writes from this batch and
+                # release the SQLite lock by closing the connection.
+                # Sleep a tick to give any waiting writer a real
+                # chance to grab the lock before we reopen.
+                conn.commit()
+                conn.close()
+                if INTER_BATCH_SLEEP > 0:
+                    time.sleep(INTER_BATCH_SLEEP)
+                conn = _init_db(db_path)
+
+                # Safety: if the table is shorter than the batch we
+                # asked for, we're done.
+                if len(batch) < BATCH_SIZE:
+                    break
 
             if missing:
                 logger.info("Purging %d missing videos from geodata.db", len(missing))
@@ -2772,29 +2115,194 @@ def purge_deleted_videos(db_path: str, teslacam_path: Optional[str] = None,
     }
 
 
-def boot_catchup_scan(db_path: str, teslacam_path: str,
+def _kv_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    """Read a value from the ``kv_meta`` table. Returns None if absent."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM kv_meta WHERE key = ?", (key,),
+        ).fetchone()
+        return row[0] if row else None
+    except sqlite3.Error:
+        return None
+
+
+def _kv_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """Upsert a value into the ``kv_meta`` table. Best-effort; logs on failure."""
+    try:
+        conn.execute(
+            "INSERT INTO kv_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.warning("kv_meta upsert failed for %r: %s", key, e)
+
+
+# Persistent key for the boot catch-up watermark (Phase E).
+_BOOT_CATCHUP_WATERMARK_KEY = 'boot_catchup_archived_max_mtime'
+
+
+def _iter_archived_with_mtime() -> Generator[Tuple[str, float], None, None]:
+    """Yield ``(path, mtime)`` for every front-camera mp4 under ARCHIVE_DIR.
+
+    Sister generator to ``_find_archived_videos`` that also returns the
+    file's mtime so the boot catch-up scan (Phase E) can apply its
+    watermark gate without an extra ``os.stat`` round-trip per file.
+    Yields nothing if archiving is disabled or the directory is absent.
+    """
+    try:
+        from config import ARCHIVE_DIR, ARCHIVE_ENABLED
+    except ImportError:
+        return
+    if not ARCHIVE_ENABLED or not ARCHIVE_DIR or not os.path.isdir(ARCHIVE_DIR):
+        return
+
+    def _stat_mtime(p: str) -> Optional[float]:
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return None
+
+    # Top-level mp4s (legacy archive layout — flat directory).
+    try:
+        for f in sorted(os.listdir(ARCHIVE_DIR)):
+            full = os.path.join(ARCHIVE_DIR, f)
+            if (
+                os.path.isfile(full)
+                and f.lower().endswith('.mp4')
+                and '-front' in f.lower()
+            ):
+                m = _stat_mtime(full)
+                if m is not None:
+                    yield full, m
+    except OSError:
+        return
+
+    for sub in ('RecentClips', 'SavedClips', 'SentryClips'):
+        sub_path = os.path.join(ARCHIVE_DIR, sub)
+        if not os.path.isdir(sub_path):
+            continue
+        try:
+            for entry in sorted(os.listdir(sub_path)):
+                entry_path = os.path.join(sub_path, entry)
+                if os.path.isfile(entry_path):
+                    if (
+                        entry.lower().endswith('.mp4')
+                        and '-front' in entry.lower()
+                    ):
+                        m = _stat_mtime(entry_path)
+                        if m is not None:
+                            yield entry_path, m
+                    continue
+                if not os.path.isdir(entry_path):
+                    continue
+                try:
+                    for f in sorted(os.listdir(entry_path)):
+                        if f.lower().endswith('.mp4') and '-front' in f.lower():
+                            ev_path = os.path.join(entry_path, f)
+                            m = _stat_mtime(ev_path)
+                            if m is not None:
+                                yield ev_path, m
+                except OSError:
+                    continue
+        except OSError:
+            continue
+
+
+def boot_catchup_scan(db_path: str, teslacam_path: str = '',
                       *, source: str = 'catchup') -> Dict[str, int]:
     """Diff filesystem vs ``indexed_files`` and enqueue any orphans.
 
-    Replaces the legacy "auto-index on startup" full re-scan. Cheap by
-    design: one ``os.listdir`` walk via :func:`_find_front_camera_videos`
-    + one bulk SELECT of every indexed canonical_key + an in-memory diff
-    + one batch INSERT into ``indexing_queue``. No video parsing happens
-    here — that's the worker's job.
+    **Phase 2b (issue #76)**: This walks ONLY ``ARCHIVE_DIR``
+    (``~/ArchivedClips``). The ``archive_producer`` thread handles
+    USB-side catch-up by enqueueing into ``archive_queue``; the
+    ``archive_worker`` then copies clips into ArchivedClips, where
+    this scan picks them up if the indexer happened to be down at the
+    moment of the worker's enqueue (e.g. a manual scp landed a clip
+    while ``gadget_web`` was restarting).
 
-    Returns ``{scanned, already_indexed, enqueued}``. The
-    ``active_file`` banner stays off during this call (no parsing); the
-    banner only lights up when the worker actually picks up an orphan.
+    **Phase E (issue #184 Wave 2)**: A persistent watermark
+    (``kv_meta.boot_catchup_archived_max_mtime``) records the highest
+    file mtime seen by any prior run. The walker stat()s every file
+    (a cheap inode read) but only does the canonical_key + DB-lookup
+    + enqueue work for files newer than the watermark. The first run
+    after upgrade still pays the full cost, but every subsequent boot
+    drops to O(new files) — typically zero work because the file
+    watcher already handled real-time arrivals.
+
+    The ``teslacam_path`` parameter is accepted for backward
+    compatibility but is **ignored** — there is intentionally no path
+    from this function to the RO USB mount any more.
+
+    Returns ``{scanned, already_indexed, enqueued, skipped_by_watermark}``.
+    The ``active_file`` banner stays off during this call (no
+    parsing); the banner only lights up when the worker actually
+    picks up an orphan.
     """
-    result = {'scanned': 0, 'already_indexed': 0, 'enqueued': 0}
-    if not teslacam_path or not os.path.isdir(teslacam_path):
-        logger.debug("boot_catchup_scan: TeslaCam path not accessible")
+    # ``teslacam_path`` is intentionally ignored — see docstring.
+    del teslacam_path
+    result = {
+        'scanned': 0, 'already_indexed': 0, 'enqueued': 0,
+        'skipped_by_watermark': 0,
+    }
+
+    # First pass: collect new (path, mtime) tuples; everything below the
+    # watermark is dropped without any string slicing or DB work.
+    try:
+        conn = _init_db(db_path)
+        try:
+            wm_raw = _kv_get(conn, _BOOT_CATCHUP_WATERMARK_KEY)
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning(
+            "boot_catchup_scan: watermark read failed (%s) — full scan",
+            e,
+        )
+        wm_raw = None
+
+    try:
+        watermark = float(wm_raw) if wm_raw is not None else 0.0
+    except (TypeError, ValueError):
+        watermark = 0.0
+
+    new_files: List[Tuple[str, float]] = []
+    new_max_mtime = watermark
+    for fpath, mtime in _iter_archived_with_mtime():
+        result['scanned'] += 1
+        if mtime > new_max_mtime:
+            new_max_mtime = mtime
+        if mtime <= watermark:
+            result['skipped_by_watermark'] += 1
+            continue
+        new_files.append((fpath, mtime))
+
+    # Fast path: nothing new since last boot — skip the DB read entirely.
+    if not new_files:
+        if new_max_mtime > watermark:
+            try:
+                conn = _init_db(db_path)
+                try:
+                    _kv_set(
+                        conn, _BOOT_CATCHUP_WATERMARK_KEY,
+                        repr(new_max_mtime),
+                    )
+                finally:
+                    conn.close()
+            except sqlite3.Error as e:
+                logger.warning(
+                    "boot_catchup_scan: watermark write failed: %s", e,
+                )
+        logger.info(
+            "boot_catchup_scan: scanned=%d, already_indexed=0, "
+            "enqueued=0, skipped_by_watermark=%d (watermark=%.3f, "
+            "no new files)",
+            result['scanned'], result['skipped_by_watermark'], watermark,
+        )
         return result
 
-    # Build the set of canonical_keys already represented in
-    # indexed_files. We diff against canonical keys (not raw paths) so a
-    # clip that exists in both Recent and Archived doesn't get
-    # re-enqueued.
+    # Slow path: load the existing canonical-key sets and dedup.
     try:
         conn = _init_db(db_path)
         try:
@@ -2820,8 +2328,7 @@ def boot_catchup_scan(db_path: str, teslacam_path: str,
     indexed_keys.discard('')
 
     to_enqueue: List[Tuple[str, Optional[int]]] = []
-    for fpath in _find_front_camera_videos(teslacam_path):
-        result['scanned'] += 1
+    for fpath, _mtime in new_files:
         key = canonical_key(fpath)
         if not key:
             continue
@@ -2837,17 +2344,41 @@ def boot_catchup_scan(db_path: str, teslacam_path: str,
         queued_keys.add(key)
 
     if to_enqueue:
+        # Phase 3c.1 (#100): queue API moved to indexing_queue_service.
+        # Lazy import to avoid load-order surprises (the queue module
+        # imports ``canonical_key`` from this module at top-level).
+        from services.indexing_queue_service import enqueue_many_for_indexing
         n = enqueue_many_for_indexing(db_path, to_enqueue, source=source)
         result['enqueued'] = n
+
+    # Persist new watermark — even if nothing was enqueued (the files
+    # might already have been indexed via the realtime watcher path).
+    if new_max_mtime > watermark:
+        try:
+            conn = _init_db(db_path)
+            try:
+                _kv_set(
+                    conn, _BOOT_CATCHUP_WATERMARK_KEY,
+                    repr(new_max_mtime),
+                )
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            logger.warning(
+                "boot_catchup_scan: watermark write failed: %s", e,
+            )
+
     logger.info(
-        "boot_catchup_scan: scanned=%d, already_indexed=%d, enqueued=%d",
+        "boot_catchup_scan: scanned=%d, already_indexed=%d, enqueued=%d, "
+        "skipped_by_watermark=%d (watermark=%.3f → %.3f)",
         result['scanned'], result['already_indexed'], result['enqueued'],
+        result['skipped_by_watermark'], watermark, new_max_mtime,
     )
     return result
 
 
 # ---------------------------------------------------------------------------
-# Daily stale-data sweep
+# Periodic stale-data sweep (issue #184 Wave 2 — Phase F)
 # ---------------------------------------------------------------------------
 
 # Independent safety net for the case where ``purge_deleted_videos`` calls
@@ -2860,18 +2391,27 @@ def boot_catchup_scan(db_path: str, teslacam_path: str,
 # (e.g. files Tesla rotated out of RecentClips while the Pi was off)
 # get cleaned up before the user opens the map page, but long enough
 # that boot-time IO doesn't compete with USB gadget presentation.
-# Subsequent fires happen ~daily with jitter so multiple Pis don't
-# hammer the same minute.
 #
-# Out-of-cycle scans can be triggered with :func:`trigger_stale_scan_now`
-# from high-signal events (after each archive cycle, on the first map
-# page load after a restart). The trigger is debounced so concurrent
-# triggers from different services collapse into a single scan.
-_DAILY_STALE_SCAN_INTERVAL = 24 * 60 * 60  # 24 hours
-_DAILY_STALE_SCAN_JITTER = 60 * 60         # +/- 1 hour
-_INITIAL_STALE_SCAN_BASE = 5 * 60          # 5 minutes after boot
-_INITIAL_STALE_SCAN_JITTER = 5 * 60        # +0..5 min spread
-_TRIGGER_DEBOUNCE_SECONDS = 10 * 60        # 10 minutes between fires
+# **Cadence (issue #184 Wave 2 — Phase F):** Subsequent fires happen
+# ~monthly (was: daily) with jitter so multiple Pis don't hammer the
+# same minute. The watcher's per-delete callback is the real-time
+# cleanup path — it stat()s nothing, just deletes the row whose
+# canonical_key was just removed. The periodic sweep is the safety
+# net for the rare case where a delete happened while gadget_web
+# was down (e.g., the user copied an SD-card image off the Pi or a
+# manual ``rm`` happened over SSH); for a 10k-clip install this
+# cuts ``os.path.isfile`` syscalls from 10,000/day → 10,000/month
+# (~30× reduction). Out-of-cycle scans can be triggered with
+# :func:`trigger_stale_scan_now` from high-signal events (after each
+# archive cycle, on the first map page load after a restart, when
+# disk-space drops to ``critical``, or when the user clicks a
+# Reconcile button). The trigger is debounced so concurrent triggers
+# from different services collapse into a single scan.
+_DAILY_STALE_SCAN_INTERVAL = 30 * 24 * 60 * 60  # 30 days (was: 24 h)
+_DAILY_STALE_SCAN_JITTER = 24 * 60 * 60         # +/- 1 day (was: +/- 1 h)
+_INITIAL_STALE_SCAN_BASE = 5 * 60               # 5 minutes after boot
+_INITIAL_STALE_SCAN_JITTER = 5 * 60             # +0..5 min spread
+_TRIGGER_DEBOUNCE_SECONDS = 10 * 60             # 10 minutes between fires
 _daily_stale_scan_thread: Optional[threading.Thread] = None
 _daily_stale_scan_stop: Optional[threading.Event] = None
 _stale_scan_state_lock = threading.Lock()
@@ -2929,15 +2469,42 @@ def _run_stale_scan_blocking(db_path: str, teslacam_path_provider,
             tc = teslacam_path_provider
         if tc and os.path.isdir(tc):
             result = purge_deleted_videos(db_path, teslacam_path=tc)
+            # Issue #110 — also clean up orphaned indexer dead-letter
+            # rows whose source file is gone (e.g., retention pruned
+            # a truncated archive copy that the indexer dead-lettered
+            # for "No mdat box found"). Same problem class as the
+            # ``indexed_files`` orphan sweep, same place to handle it.
+            try:
+                # Local import: ``indexing_queue_service`` is at the
+                # bottom of the import graph (depended on by mapping_
+                # service callers in workers); importing it at module
+                # top would create an indirect cycle through worker
+                # boot. Lazy import here is intentional and matches
+                # the pattern used elsewhere in this module.
+                from services.indexing_queue_service import (
+                    purge_orphaned_dead_letters,
+                )
+                orphan_dl = purge_orphaned_dead_letters(db_path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Stale scan (%s): purge_orphaned_dead_letters "
+                    "failed: %s",
+                    source, e,
+                )
+                orphan_dl = 0
             logger.info(
                 "Stale scan (%s): purged %d indexed_files rows, "
-                "orphaned %d waypoints and %d events "
+                "orphaned %d waypoints and %d events, "
+                "removed %d orphaned dead-letter row(s) "
                 "(trips/waypoints preserved)",
                 source,
                 result.get('purged_files', 0),
                 result.get('purged_waypoints', 0),
                 result.get('purged_events', 0),
+                orphan_dl,
             )
+            if isinstance(result, dict):
+                result['purged_dead_letters'] = orphan_dl
             return result
         logger.debug(
             "Stale scan (%s): TeslaCam not accessible — skipping",
@@ -3293,769 +2860,7 @@ def _diagnose_nal_structure(video_path: str) -> dict:
 
     return result
 
-@_with_db_retry
-def get_db_connection(db_path: str) -> sqlite3.Connection:
-    """Get a read-only connection to the geo-index database."""
-    conn = _init_db(db_path)
-    return conn
 
-
-@_with_db_retry
-def query_trips(db_path: str, limit: int = 50, offset: int = 0,
-                bbox: Optional[Tuple[float, float, float, float]] = None,
-                date_from: Optional[str] = None,
-                date_to: Optional[str] = None,
-                min_distance_km: float = 0.05) -> List[dict]:
-    """Query trips with optional bounding box and date filters.
-
-    ``min_distance_km`` defaults to 50 m, which hides parking-lot blips and
-    isolated sentry recordings from the trip nav. Pass ``0`` to include all
-    trips regardless of distance.
-
-    Performance: ``event_count`` and ``video_count`` are computed via
-    correlated subqueries in the same SELECT so the whole call is a single
-    SQL statement regardless of page size. The earlier per-trip Python
-    loop fired 1 + 2*page_size queries (401 for a 200-trip page) and was
-    the dominant cost of opening the map page on databases with thousands
-    of waypoints.
-    """
-    conn = _init_db(db_path)
-    try:
-        sql = (
-            "SELECT t.*, "
-            "       (SELECT COUNT(*) FROM detected_events de "
-            "          WHERE de.trip_id = t.id) AS event_count, "
-            "       (SELECT COUNT(DISTINCT w.video_path) FROM waypoints w "
-            "          WHERE w.trip_id = t.id "
-            "            AND w.video_path IS NOT NULL) AS video_count "
-            "  FROM trips t "
-            " WHERE 1=1"
-        )
-        params: List = []
-
-        if min_distance_km and min_distance_km > 0:
-            sql += " AND COALESCE(t.distance_km, 0) >= ?"
-            params.append(min_distance_km)
-
-        if bbox:
-            min_lat, min_lon, max_lat, max_lon = bbox
-            sql += (" AND t.start_lat BETWEEN ? AND ? "
-                    "AND t.start_lon BETWEEN ? AND ?")
-            params.extend([min_lat, max_lat, min_lon, max_lon])
-
-        if date_from:
-            sql += " AND t.start_time >= ?"
-            params.append(date_from)
-        if date_to:
-            sql += " AND t.start_time <= ?"
-            params.append(date_to)
-
-        sql += " ORDER BY t.start_time DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-@_with_db_retry
-def query_trip_route(db_path: str, trip_id: int) -> List[dict]:
-    """Get all waypoints for a trip as a GeoJSON-ready list.
-
-    Sorted by ``timestamp ASC`` (with ``id ASC`` as tiebreaker) so
-    polylines and HUD interpolation walk the trip in true chrono-
-    logical order even when waypoints from a late-indexed video or
-    a v2->v3 trip-merge land with non-monotonic ids.
-    """
-    conn = _init_db(db_path)
-    try:
-        rows = conn.execute(
-            """SELECT lat, lon, heading, speed_mps, autopilot_state,
-                      video_path, frame_offset, timestamp,
-                      steering_angle, brake_applied, gear,
-                      acceleration_x, acceleration_y,
-                      blinker_on_left, blinker_on_right
-               FROM waypoints WHERE trip_id = ?
-               ORDER BY timestamp ASC, id ASC""",
-            (trip_id,)
-        ).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-@_with_db_retry
-def query_events(db_path: str, limit: int = 100, offset: int = 0,
-                 event_type: Optional[str] = None,
-                 severity: Optional[str] = None,
-                 bbox: Optional[Tuple[float, float, float, float]] = None,
-                 date_from: Optional[str] = None,
-                 date_to: Optional[str] = None,
-                 date: Optional[str] = None) -> List[dict]:
-    """Query detected events with optional filters.
-
-    ``date`` is a single-day filter (YYYY-MM-DD). It uses
-    ``substr(timestamp, 1, 10) = ?`` so that timezone-naive ISO
-    strings (the format Tesla writes into filenames and that the
-    indexer copies into ``waypoints.timestamp`` /
-    ``detected_events.timestamp``) bucket correctly. SQLite's
-    ``date()`` function would mis-bucket any row that ever gained a
-    ``Z`` or ``+offset`` suffix, so ``substr`` is the safer
-    contract. ``date`` and ``date_from``/``date_to`` are
-    independent: passing all three narrows progressively.
-    """
-    conn = _init_db(db_path)
-    try:
-        sql = "SELECT * FROM detected_events WHERE 1=1"
-        params = []
-
-        if event_type:
-            sql += " AND event_type = ?"
-            params.append(event_type)
-        if severity:
-            sql += " AND severity = ?"
-            params.append(severity)
-        if bbox:
-            min_lat, min_lon, max_lat, max_lon = bbox
-            sql += " AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?"
-            params.extend([min_lat, max_lat, min_lon, max_lon])
-        if date_from:
-            sql += " AND timestamp >= ?"
-            params.append(date_from)
-        if date_to:
-            sql += " AND timestamp <= ?"
-            params.append(date_to)
-        if date:
-            sql += " AND substr(timestamp, 1, 10) = ?"
-            params.append(date)
-
-        sql += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-@_with_db_retry
-def query_days(db_path: str, limit: int = 60,
-               min_distance_km: float = 0.05) -> List[dict]:
-    """Aggregate trips and events by local-day for the day navigator.
-
-    Returns one row per day that has either at least one qualifying
-    trip (``distance_km >= min_distance_km``) or at least one
-    detected event. Rows are ordered most-recent-day first.
-
-    Each returned dict has:
-      * ``date`` — ISO ``YYYY-MM-DD`` string
-      * ``trip_count`` — qualifying trip count for the day
-      * ``total_distance_km`` — sum of qualifying trip distances
-      * ``event_count`` — total detected events
-      * ``sentry_count`` — events with ``event_type='sentry'``
-      * ``first_start`` — earliest trip ``start_time`` of the day
-        (NULL if the day is event-only)
-      * ``last_end`` — latest trip ``end_time`` (or ``start_time`` if
-        end is missing) — NULL if the day is event-only
-
-    Day-bucketing rule: ``substr(<column>, 1, 10)``. NEVER
-    ``date(<column>)`` — see :func:`query_events` for rationale.
-
-    Important: trips are filtered the same way ``/api/trips`` filters
-    them (``COALESCE(distance_km, 0) >= min_distance_km``, default
-    50 m). Without this, the day card would advertise "3 trips" while
-    the map only shows 1 because the other two are below the
-    distance threshold.
-
-    Performance: a single CTE-based query on indexed columns
-    (``idx_trips_day``, ``idx_events_day`` — expression indexes on
-    ``substr(<column>, 1, 10)`` introduced in schema v8). Expected
-    runtime O(days × trips_per_day) — well under 50 ms even with
-    thousands of trips.
-    """
-    if min_distance_km is None or min_distance_km < 0:
-        min_distance_km = 0.0
-    if limit is None or limit <= 0:
-        limit = 60
-
-    conn = _init_db(db_path)
-    try:
-        sql = """
-            WITH trip_days AS (
-                SELECT substr(start_time, 1, 10)            AS day,
-                       COUNT(*)                             AS trip_count,
-                       COALESCE(SUM(distance_km), 0)        AS total_distance_km,
-                       0                                    AS event_count,
-                       0                                    AS sentry_count,
-                       MIN(start_time)                      AS first_start,
-                       MAX(COALESCE(end_time, start_time))  AS last_end
-                  FROM trips
-                 WHERE start_time IS NOT NULL
-                   AND COALESCE(distance_km, 0) >= ?
-                 GROUP BY day
-            ),
-            event_days AS (
-                SELECT substr(timestamp, 1, 10)             AS day,
-                       0                                    AS trip_count,
-                       0.0                                  AS total_distance_km,
-                       COUNT(*)                             AS event_count,
-                       SUM(CASE WHEN event_type='sentry' THEN 1 ELSE 0 END) AS sentry_count,
-                       NULL                                 AS first_start,
-                       NULL                                 AS last_end
-                  FROM detected_events
-                 WHERE timestamp IS NOT NULL
-                 GROUP BY day
-            )
-            SELECT day                                      AS date,
-                   SUM(trip_count)                          AS trip_count,
-                   SUM(total_distance_km)                   AS total_distance_km,
-                   SUM(event_count)                         AS event_count,
-                   SUM(sentry_count)                        AS sentry_count,
-                   MIN(first_start)                         AS first_start,
-                   MAX(last_end)                            AS last_end
-              FROM (
-                  SELECT * FROM trip_days
-                  UNION ALL
-                  SELECT * FROM event_days
-              )
-             WHERE day IS NOT NULL
-             GROUP BY day
-             ORDER BY day DESC
-             LIMIT ?
-        """
-        rows = conn.execute(sql, (min_distance_km, limit)).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-@_with_db_retry
-def query_day_routes(db_path: str, date_str: str,
-                     min_distance_km: float = 0.05) -> Dict[str, Any]:
-    """Return all trip routes (with waypoints) that started on ``date_str``.
-
-    ``date_str`` must be ISO ``YYYY-MM-DD``; the caller is expected
-    to validate the format before calling. Day-bucketing is by
-    ``substr(start_time, 1, 10)`` — a midnight-spanning trip belongs
-    to the day it started, not the day it ended (matches
-    :func:`query_days`).
-
-    Returns ``{'trips': [...]}`` where each trip has the same
-    metadata fields as :func:`query_trips` plus a ``waypoints`` list
-    sorted by ``timestamp ASC`` (with ``id ASC`` as a tiebreaker).
-    Sorting by id alone is NOT sufficient: when the v2->v3 trip-
-    merge migration combines two originally-separate trips, or when
-    a late-arriving video gets indexed into an existing trip (boot
-    catch-up scan, file watcher, ArchivedClips re-discovery), the
-    new waypoints land with higher ids but their timestamps fall in
-    the middle of the existing trip's time range. Walking those in
-    id-order draws long straight diagonals across the map. Sorting
-    by timestamp restores the true chronological sequence.
-
-    Waypoints are NOT post-processed — callers (i.e. the blueprint)
-    are responsible for path normalization (``ArchivedClips`` prefix
-    stripping) so the service stays free of presentation concerns.
-
-    Performance: one INNER JOIN; ``idx_trips_day`` (expression index
-    on ``substr(start_time, 1, 10)``, schema v8) makes the date filter
-    O(log n), then ``idx_waypoints_trip`` covers the join. All trip
-    waypoints come back in one round trip, then we group in Python.
-    For the worst-case 10-trip day with 500 waypoints each (5000
-    rows), this is well under 100 ms on a Pi Zero 2 W.
-
-    Trips with zero waypoints are excluded by the INNER JOIN —
-    those wouldn't render on the map anyway. The day card's
-    ``trip_count`` from :func:`query_days` may therefore exceed
-    ``len(result['trips'])`` if some trips were drift artifacts
-    with no GPS — that's surfaced in the UI as expected.
-    """
-    if min_distance_km is None or min_distance_km < 0:
-        min_distance_km = 0.0
-
-    conn = _init_db(db_path)
-    try:
-        sql = """
-            SELECT t.id                AS trip_id,
-                   t.start_time        AS start_time,
-                   t.end_time          AS end_time,
-                   t.distance_km       AS distance_km,
-                   t.duration_seconds  AS duration_seconds,
-                   t.start_lat         AS start_lat,
-                   t.start_lon         AS start_lon,
-                   t.end_lat           AS end_lat,
-                   t.end_lon           AS end_lon,
-                   t.source_folder     AS source_folder,
-                   w.id                AS waypoint_id,
-                   w.timestamp         AS w_timestamp,
-                   w.lat               AS w_lat,
-                   w.lon               AS w_lon,
-                   w.heading           AS w_heading,
-                   w.speed_mps         AS w_speed_mps,
-                   w.acceleration_x    AS w_acceleration_x,
-                   w.acceleration_y    AS w_acceleration_y,
-                   w.gear              AS w_gear,
-                   w.autopilot_state   AS w_autopilot_state,
-                   w.steering_angle    AS w_steering_angle,
-                   w.brake_applied     AS w_brake_applied,
-                   w.blinker_on_left   AS w_blinker_on_left,
-                   w.blinker_on_right  AS w_blinker_on_right,
-                   w.video_path        AS w_video_path,
-                   w.frame_offset      AS w_frame_offset
-              FROM trips t
-              JOIN waypoints w ON w.trip_id = t.id
-             WHERE substr(t.start_time, 1, 10) = ?
-               AND COALESCE(t.distance_km, 0) >= ?
-             ORDER BY t.start_time DESC, w.timestamp ASC, w.id ASC
-        """
-        rows = conn.execute(sql, (date_str, min_distance_km)).fetchall()
-
-        # Group rows by trip_id, preserving the SELECT order (start_time DESC).
-        trips_by_id: Dict[int, dict] = {}
-        order: List[int] = []
-        for row in rows:
-            trip_id = row['trip_id']
-            trip = trips_by_id.get(trip_id)
-            if trip is None:
-                trip = {
-                    'trip_id': trip_id,
-                    'start_time': row['start_time'],
-                    'end_time': row['end_time'],
-                    'distance_km': row['distance_km'],
-                    'duration_seconds': row['duration_seconds'],
-                    'start_lat': row['start_lat'],
-                    'start_lon': row['start_lon'],
-                    'end_lat': row['end_lat'],
-                    'end_lon': row['end_lon'],
-                    'source_folder': row['source_folder'],
-                    'waypoints': [],
-                }
-                trips_by_id[trip_id] = trip
-                order.append(trip_id)
-            trip['waypoints'].append({
-                'id': row['waypoint_id'],
-                'timestamp': row['w_timestamp'],
-                'lat': row['w_lat'],
-                'lon': row['w_lon'],
-                'heading': row['w_heading'],
-                'speed_mps': row['w_speed_mps'],
-                'acceleration_x': row['w_acceleration_x'],
-                'acceleration_y': row['w_acceleration_y'],
-                'gear': row['w_gear'],
-                'autopilot_state': row['w_autopilot_state'],
-                'steering_angle': row['w_steering_angle'],
-                'brake_applied': row['w_brake_applied'],
-                'blinker_on_left': row['w_blinker_on_left'],
-                'blinker_on_right': row['w_blinker_on_right'],
-                'video_path': row['w_video_path'],
-                'frame_offset': row['w_frame_offset'],
-            })
-
-        # Walk each trip's waypoints and stamp ``gap_after = True`` on
-        # every waypoint that is followed by a polyline-breaking gap
-        # (see ``_is_gap_between`` for the criteria). The frontend
-        # renderer ends the current polyline whenever it sees this
-        # flag, so a 6-minute parking break or an SEI clock-skew zigzag
-        # no longer renders as a long straight diagonal across the map.
-        # The flag is omitted when there's no gap so payload size on
-        # the wire is unchanged for clean trips.
-        for trip in trips_by_id.values():
-            wps = trip['waypoints']
-            for i in range(len(wps) - 1):
-                if _is_gap_between(
-                    wps[i].get('timestamp'), wps[i].get('lat'), wps[i].get('lon'),
-                    wps[i + 1].get('timestamp'), wps[i + 1].get('lat'), wps[i + 1].get('lon'),
-                ):
-                    wps[i]['gap_after'] = True
-
-        return {'trips': [trips_by_id[tid] for tid in order]}
-    finally:
-        conn.close()
-
-
-@_with_db_retry
-def query_all_routes_simplified(
-    db_path: str,
-    min_distance_km: float = 0.05,
-    epsilon_m: float = 8.0,
-    max_points_per_trip: int = 200,
-) -> List[dict]:
-    """Return every indexed trip with shape-aware simplified
-    waypoints for the "All time" map overview.
-
-    Each trip's waypoints are simplified using the Ramer-Douglas-
-    Peucker algorithm (:func:`_simplify_polyline_rdp`) with
-    ``epsilon_m`` as the per-point perpendicular-distance tolerance
-    (default 8 m, which is above typical GPS noise yet tight enough
-    that any road feature is visually preserved at any zoom). The
-    earlier stride-sampling implementation cut straight across road
-    curves between kept points, producing visibly wrong polylines on
-    long trips — RDP fixes that by keeping the points whose
-    perpendicular distance to the simplified path exceeds the
-    tolerance, so corners survive and straight stretches collapse
-    naturally.
-
-    ``max_points_per_trip`` (default 200) is a safety cap applied
-    after RDP; only pathologically zigzag trips would ever hit it.
-    Trips below ``min_distance_km`` and trips with fewer than 2
-    valid waypoints are excluded — same parity guarantees as
-    :func:`query_trips` and :func:`query_day_routes`.
-
-    Returns trips ordered by ``start_time`` DESC. Each trip carries
-    enough metadata for the client to drill into the correct day on
-    polyline click (``date``) plus the simplified waypoint list
-    (only ``lat``, ``lon``, ``speed_mps`` — per-clip drilldown is
-    delegated to :func:`query_day_routes` when the user opens a day).
-
-    Performance: one SQL round trip fetches every waypoint for every
-    qualifying trip; RDP per trip is O(n log n) on average (O(n^2)
-    worst case for pathological zigzags). For a 22-trip / ~10k-
-    waypoint database this returns in ~150 ms on a Pi Zero 2 W,
-    producing ~30 points per typical trip — substantially fewer
-    points than the old stride sampler AND a visually correct
-    polyline.
-    """
-    if min_distance_km is None or min_distance_km < 0:
-        min_distance_km = 0.0
-    if epsilon_m is None or epsilon_m < 0:
-        epsilon_m = 0.0
-    if max_points_per_trip is None or max_points_per_trip < 2:
-        max_points_per_trip = 2
-
-    conn = _init_db(db_path)
-    try:
-        # Single fetch of every waypoint for every qualifying trip,
-        # ordered so trips group together newest-first and waypoints
-        # within a trip stay chronological. RDP needs the full
-        # sequence (per trip) — there's no SQL-side simplification
-        # we can do that preserves shape.
-        sql = """
-            SELECT t.id                AS trip_id,
-                   t.start_time        AS start_time,
-                   t.end_time          AS end_time,
-                   t.start_lat         AS start_lat,
-                   t.start_lon         AS start_lon,
-                   t.end_lat           AS end_lat,
-                   t.end_lon           AS end_lon,
-                   t.distance_km       AS distance_km,
-                   t.duration_seconds  AS duration_seconds,
-                   substr(t.start_time, 1, 10) AS date,
-                   w.timestamp         AS w_timestamp,
-                   w.lat               AS lat,
-                   w.lon               AS lon,
-                   w.speed_mps         AS speed_mps
-              FROM trips t
-              JOIN waypoints w ON w.trip_id = t.id
-             WHERE t.start_time IS NOT NULL
-               AND COALESCE(t.distance_km, 0) >= ?
-               AND w.lat IS NOT NULL
-               AND w.lon IS NOT NULL
-             ORDER BY t.start_time DESC, w.timestamp ASC, w.id ASC
-        """
-        rows = conn.execute(sql, (min_distance_km,)).fetchall()
-
-        trips_by_id: Dict[int, dict] = {}
-        order: List[int] = []
-        raw_by_id: Dict[int, List[tuple]] = {}
-        for row in rows:
-            trip_id = row['trip_id']
-            trip = trips_by_id.get(trip_id)
-            if trip is None:
-                trip = {
-                    'trip_id': trip_id,
-                    'date': row['date'],
-                    'start_time': row['start_time'],
-                    'end_time': row['end_time'],
-                    'start_lat': row['start_lat'],
-                    'start_lon': row['start_lon'],
-                    'end_lat': row['end_lat'],
-                    'end_lon': row['end_lon'],
-                    'distance_km': row['distance_km'],
-                    'duration_seconds': row['duration_seconds'],
-                }
-                trips_by_id[trip_id] = trip
-                order.append(trip_id)
-                raw_by_id[trip_id] = []
-            raw_by_id[trip_id].append(
-                (row['w_timestamp'], row['lat'], row['lon'], row['speed_mps'])
-            )
-
-        # Split each trip into gap-free segments BEFORE applying RDP,
-        # then RDP per segment, then concatenate the simplified
-        # waypoints with a ``gap_after`` flag at every segment boundary.
-        # Two reasons we split before RDP rather than just flagging the
-        # raw boundary points and trusting RDP to keep them:
-        #   1. RDP picks points by perpendicular distance from a chord
-        #      that crosses the gap. The chord IS the bug: it picks the
-        #      gap endpoints as outliers, then keeps an apparently
-        #      "smooth" line that visibly cuts across the map.
-        #   2. Per-segment RDP gives each real segment its own epsilon
-        #      budget, so a short pre-gap subroute (say a 3-point loop
-        #      around a parking lot) doesn't get crushed by the noise
-        #      floor of a multi-mile freeway segment in the same trip.
-        # Trips with <2 valid waypoints are dropped — they can't render
-        # a polyline.
-        result: List[dict] = []
-        for trip_id in order:
-            raw = raw_by_id[trip_id]
-            if len(raw) < 2:
-                continue
-
-            segments: List[List[tuple]] = []
-            current: List[tuple] = [raw[0]]
-            for i in range(1, len(raw)):
-                a, b = raw[i - 1], raw[i]
-                if _is_gap_between(a[0], a[1], a[2], b[0], b[1], b[2]):
-                    segments.append(current)
-                    current = [b]
-                else:
-                    current.append(b)
-            segments.append(current)
-
-            output: List[dict] = []
-            for seg_idx, seg in enumerate(segments):
-                if len(seg) < 2:
-                    # Single-point segment can't render but its endpoint
-                    # should still terminate any prior polyline at the
-                    # gap; emit it carrying the gap flag so the renderer
-                    # closes the prior segment cleanly.
-                    seg_out = [{
-                        'lat': seg[0][1], 'lon': seg[0][2],
-                        'speed_mps': seg[0][3],
-                    }]
-                else:
-                    latlons = [(p[1], p[2]) for p in seg]
-                    kept = _simplify_polyline_rdp(latlons, epsilon_m=epsilon_m)
-                    seg_out = [
-                        {'lat': seg[i][1], 'lon': seg[i][2],
-                         'speed_mps': seg[i][3]}
-                        for i in kept
-                    ]
-                if seg_idx < len(segments) - 1 and seg_out:
-                    seg_out[-1]['gap_after'] = True
-                output.extend(seg_out)
-
-            if len(output) > max_points_per_trip:
-                # Pathological case: even after per-segment RDP we have
-                # too many points. Stride down to the cap, but always
-                # keep the very last point so the polyline terminates
-                # at the actual trip end. Note: stride-sampling can
-                # drop a ``gap_after`` flagged point — re-stamp the
-                # flag onto whichever simplified point now precedes
-                # each gap so the renderer still breaks correctly.
-                step = max(1, len(output) // max_points_per_trip)
-                gap_after_lats = {
-                    (p['lat'], p['lon']) for p in output if p.get('gap_after')
-                }
-                stride_kept = output[::step]
-                if stride_kept[-1] is not output[-1]:
-                    stride_kept.append(output[-1])
-                # Re-apply gap_after on the last surviving point of each
-                # original gap-bounded segment.
-                seen_gaps = set()
-                for p in stride_kept:
-                    if (p['lat'], p['lon']) in gap_after_lats:
-                        p['gap_after'] = True
-                        seen_gaps.add((p['lat'], p['lon']))
-                # If a gap point was dropped entirely, fall back to
-                # flagging the nearest surviving simplified point that
-                # was originally before that gap.
-                missed = gap_after_lats - seen_gaps
-                if missed:
-                    flat_indexed = list(enumerate(output))
-                    for ml, mlon in missed:
-                        # Find the original index of the missed gap point.
-                        orig_idx = next(
-                            (i for i, p in flat_indexed
-                             if p['lat'] == ml and p['lon'] == mlon),
-                            None,
-                        )
-                        if orig_idx is None:
-                            continue
-                        # Walk back to the nearest stride-kept point at
-                        # or before that original index.
-                        for sp in reversed(stride_kept):
-                            si = next(
-                                (i for i, p in flat_indexed if p is sp),
-                                None,
-                            )
-                            if si is not None and si <= orig_idx:
-                                sp['gap_after'] = True
-                                break
-                output = stride_kept
-
-            trip = trips_by_id[trip_id]
-            trip['waypoints'] = output
-            result.append(trip)
-
-        return result
-    finally:
-        conn.close()
-
-
-@_with_db_retry
-def get_stats(db_path: str) -> dict:
-    """Get summary statistics from the geo-index database."""
-    conn = _init_db(db_path)
-    try:
-        trip_count = conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0]
-        waypoint_count = conn.execute("SELECT COUNT(*) FROM waypoints").fetchone()[0]
-        event_count = conn.execute("SELECT COUNT(*) FROM detected_events").fetchone()[0]
-        file_count = conn.execute("SELECT COUNT(*) FROM indexed_files").fetchone()[0]
-        # Count only files that produced GPS waypoints (meaningful for map display)
-        mapped_file_count = conn.execute(
-            "SELECT COUNT(*) FROM indexed_files WHERE waypoint_count > 0"
-        ).fetchone()[0]
-
-        total_distance = conn.execute(
-            "SELECT COALESCE(SUM(distance_km), 0) FROM trips"
-        ).fetchone()[0]
-        total_duration = conn.execute(
-            "SELECT COALESCE(SUM(duration_seconds), 0) FROM trips"
-        ).fetchone()[0]
-
-        event_breakdown = {}
-        for row in conn.execute(
-            "SELECT event_type, COUNT(*) as cnt FROM detected_events GROUP BY event_type"
-        ).fetchall():
-            event_breakdown[row['event_type']] = row['cnt']
-
-        return {
-            'trip_count': trip_count,
-            'waypoint_count': waypoint_count,
-            'event_count': event_count,
-            'indexed_file_count': file_count,
-            'mapped_file_count': mapped_file_count,
-            'total_distance_km': round(total_distance, 2),
-            'total_duration_seconds': total_duration,
-            'event_breakdown': event_breakdown,
-            'indexer_status': _get_worker_status_for_stats(),
-        }
-    finally:
-        conn.close()
-
-
-@_with_db_retry
-def get_driving_stats(db_path: str) -> dict:
-    """Get driving behavior statistics for the analytics dashboard."""
-    conn = _init_db(db_path)
-    try:
-        trip_count = conn.execute("SELECT COUNT(*) FROM trips").fetchone()[0]
-        if trip_count == 0:
-            return {'has_data': False}
-
-        total_distance = conn.execute(
-            "SELECT COALESCE(SUM(distance_km), 0) FROM trips"
-        ).fetchone()[0]
-        total_duration = conn.execute(
-            "SELECT COALESCE(SUM(duration_seconds), 0) FROM trips"
-        ).fetchone()[0]
-        avg_speed = conn.execute(
-            "SELECT COALESCE(AVG(speed_mps), 0) FROM waypoints WHERE speed_mps > 0.5"
-        ).fetchone()[0]
-        max_speed = conn.execute(
-            "SELECT COALESCE(MAX(speed_mps), 0) FROM waypoints"
-        ).fetchone()[0]
-
-        # FSD usage
-        total_wp = conn.execute("SELECT COUNT(*) FROM waypoints").fetchone()[0]
-        fsd_wp = conn.execute(
-            "SELECT COUNT(*) FROM waypoints WHERE autopilot_state IN ('SELF_DRIVING', 'AUTOSTEER')"
-        ).fetchone()[0]
-        fsd_pct = round((fsd_wp / total_wp * 100) if total_wp > 0 else 0, 1)
-
-        # Events per 100 km (driving score proxy)
-        event_count = conn.execute("SELECT COUNT(*) FROM detected_events").fetchone()[0]
-        warning_count = conn.execute(
-            "SELECT COUNT(*) FROM detected_events WHERE severity IN ('warning', 'critical')"
-        ).fetchone()[0]
-        events_per_100km = round(
-            (warning_count / total_distance * 100) if total_distance > 0 else 0, 1
-        )
-
-        return {
-            'has_data': True,
-            'trip_count': trip_count,
-            'total_distance_km': round(total_distance, 1),
-            'total_distance_mi': round(total_distance * 0.621371, 1),
-            'total_duration_hours': round(total_duration / 3600, 1),
-            'avg_speed_mph': round(avg_speed * 2.23694, 1),
-            'max_speed_mph': round(max_speed * 2.23694, 1),
-            'avg_speed_kph': round(avg_speed * 3.6, 1),
-            'max_speed_kph': round(max_speed * 3.6, 1),
-            'fsd_usage_pct': fsd_pct,
-            'total_events': event_count,
-            'warning_events': warning_count,
-            'events_per_100km': events_per_100km,
-        }
-    finally:
-        conn.close()
-
-
-@_with_db_retry
-def get_event_chart_data(db_path: str) -> dict:
-    """Get event data formatted for Chart.js rendering."""
-    conn = _init_db(db_path)
-    try:
-        # Events by type
-        type_rows = conn.execute(
-            """SELECT event_type, COUNT(*) as cnt
-               FROM detected_events GROUP BY event_type ORDER BY cnt DESC"""
-        ).fetchall()
-        by_type = {
-            'labels': [r['event_type'].replace('_', ' ').title() for r in type_rows],
-            'values': [r['cnt'] for r in type_rows],
-        }
-
-        # Events by severity
-        sev_rows = conn.execute(
-            """SELECT severity, COUNT(*) as cnt
-               FROM detected_events GROUP BY severity ORDER BY
-               CASE severity WHEN 'critical' THEN 1 WHEN 'warning' THEN 2 ELSE 3 END"""
-        ).fetchall()
-        by_severity = {
-            'labels': [r['severity'].title() for r in sev_rows],
-            'values': [r['cnt'] for r in sev_rows],
-            'colors': [
-                '#dc3545' if r['severity'] == 'critical'
-                else '#ffc107' if r['severity'] == 'warning'
-                else '#17a2b8'
-                for r in sev_rows
-            ],
-        }
-
-        # Events over time (by day, last 30 days)
-        time_rows = conn.execute(
-            """SELECT DATE(timestamp) as day, COUNT(*) as cnt
-               FROM detected_events
-               WHERE timestamp >= DATE('now', '-30 days')
-               GROUP BY day ORDER BY day"""
-        ).fetchall()
-        over_time = {
-            'labels': [r['day'] for r in time_rows],
-            'values': [r['cnt'] for r in time_rows],
-        }
-
-        # FSD engage vs manual over time (by day)
-        fsd_rows = conn.execute(
-            """SELECT DATE(timestamp) as day,
-                      SUM(CASE WHEN autopilot_state IN ('SELF_DRIVING','AUTOSTEER') THEN 1 ELSE 0 END) as fsd,
-                      SUM(CASE WHEN autopilot_state NOT IN ('SELF_DRIVING','AUTOSTEER') THEN 1 ELSE 0 END) as manual
-               FROM waypoints
-               WHERE timestamp >= DATE('now', '-30 days')
-               GROUP BY day ORDER BY day"""
-        ).fetchall()
-        fsd_timeline = {
-            'labels': [r['day'] for r in fsd_rows],
-            'fsd': [r['fsd'] for r in fsd_rows],
-            'manual': [r['manual'] for r in fsd_rows],
-        }
-
-        return {
-            'by_type': by_type,
-            'by_severity': by_severity,
-            'over_time': over_time,
-            'fsd_timeline': fsd_timeline,
-        }
-    finally:
-        conn.close()
+# ---------------------------------------------------------------------------
+# Read-only query helpers moved to services.mapping_queries (Phase 3c.3, #100)
+# ---------------------------------------------------------------------------

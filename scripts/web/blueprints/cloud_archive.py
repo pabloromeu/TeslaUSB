@@ -61,25 +61,43 @@ def _get_cloud_config_cached() -> dict:
         data = cfg.get('cloud_archive', {})
         _cloud_config_cache['data'] = data
         _cloud_config_cache['ts'] = now
-        # Piggyback the live_event_sync section on the same disk read so
-        # the cloud archive page can render LES settings without a
-        # second yaml.load() per pageview.
-        _cloud_config_cache['les_data'] = cfg.get('live_event_sync', {}) or {}
         return data
     except Exception:
         return _cloud_config_cache.get('data', {})
 
 
-def _get_les_config_cached() -> dict:
-    """Return live_event_sync section from config.yaml, cached for 30s.
+def _resolve_keep_clips_until_synced(cloud_cfg: dict) -> bool:
+    """Translate ``cloud_archive.delete_unsynced`` into the UI toggle state.
 
-    Always cache-coherent with ``_get_cloud_config_cached()`` because
-    they share the same dict; calling either one refreshes both.
+    The web UI exposes a positive-framed toggle ("Keep clips until
+    backed up to cloud") which is the inverse of the backend
+    ``delete_unsynced`` boolean. When the YAML key is unset
+    (``None``), fall back to the same auto-default the watchdog uses:
+    ``True`` when a cloud provider is configured, ``False`` otherwise.
     """
-    if 'les_data' not in _cloud_config_cache:
-        # Force a populate.
-        _get_cloud_config_cached()
-    return _cloud_config_cache.get('les_data', {})
+    raw = cloud_cfg.get('delete_unsynced', None) if cloud_cfg else None
+    if raw is None:
+        provider_set = bool(CLOUD_ARCHIVE_PROVIDER) and os.path.isfile(
+            CLOUD_PROVIDER_CREDS_PATH
+        )
+        return provider_set
+    return not bool(raw)
+
+
+def _get_last_prune_kept_unsynced_count() -> int:
+    """Return the count of clips held back at the most recent prune.
+
+    Cheap (in-memory state lookup). Returns 0 when the watchdog has
+    not yet run a prune or its module is unavailable.
+    """
+    try:
+        from services import archive_watchdog
+        status = archive_watchdog.get_status()
+        return int(
+            status.get('retention', {}).get('last_prune_kept_unsynced', 0)
+        )
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -106,18 +124,29 @@ def index():
         sync_history = []
 
     # Re-read dynamic settings from config.yaml (cached for 30s to reduce I/O)
+    # Normalise sync_folders / priority_order via the same allow-list +
+    # legacy-RecentClips rewrite that config.py uses at boot — that way
+    # the Settings UI never shows a stale ``RecentClips`` checkbox even
+    # if the user's config.yaml predates the rename. The normalised
+    # values flow through both the template render and the form-submit
+    # handler so the next "Save" call also writes back the canonical form.
+    from config import _normalize_cloud_folder_list, _CLOUD_DEFAULT_FOLDERS
     import yaml
     _provider = CLOUD_ARCHIVE_PROVIDER
-    _sync_folders = CLOUD_ARCHIVE_SYNC_FOLDERS
-    _priority_order = CLOUD_ARCHIVE_PRIORITY_ORDER
+    _sync_folders = list(CLOUD_ARCHIVE_SYNC_FOLDERS)
+    _priority_order = list(CLOUD_ARCHIVE_PRIORITY_ORDER)
     _max_upload_mbps = CLOUD_ARCHIVE_MAX_UPLOAD_MBPS
     _remote_path = CLOUD_ARCHIVE_REMOTE_PATH
     _sync_enabled = True
     try:
         _cloud = _get_cloud_config_cached()
         _provider = _cloud.get('provider', '') or _provider
-        _sync_folders = _cloud.get('sync_folders', _sync_folders)
-        _priority_order = _cloud.get('priority_order', _priority_order)
+        _sync_folders = _normalize_cloud_folder_list(
+            _cloud.get('sync_folders', _sync_folders), _sync_folders,
+        )
+        _priority_order = _normalize_cloud_folder_list(
+            _cloud.get('priority_order', _priority_order), _sync_folders,
+        )
         _max_upload_mbps = int(_cloud.get('max_upload_mbps', _max_upload_mbps))
         _remote_path = _cloud.get('remote_path', _remote_path)
         _sync_enabled = bool(_cloud.get('sync_enabled', True))
@@ -139,20 +168,6 @@ def index():
 
     ctx = get_base_context()
 
-    # Load Live Event Sync (LES) config from config.yaml so the LES card
-    # in the cloud sync page can render with current values. Reads come
-    # from the same 30s cache that backs cloud_archive settings.
-    _les_cfg = _get_les_config_cached()
-    les_enabled = bool(_les_cfg.get('enabled', False))
-    les_watch_folders = list(_les_cfg.get('watch_folders', ['SentryClips', 'SavedClips']))
-    les_upload_scope = str(_les_cfg.get('upload_scope', 'event_minute'))
-    les_retry_max_attempts = int(_les_cfg.get('retry_max_attempts', 5))
-    les_retry_backoff_seconds = list(
-        _les_cfg.get('retry_backoff_seconds', [30, 120, 300, 900, 3600])
-    )
-    les_daily_data_cap_mb = int(_les_cfg.get('daily_data_cap_mb', 0))
-    les_notify_webhook_url = str(_les_cfg.get('notify_webhook_url', '') or '')
-
     return render_template(
         'cloud_archive.html',
         page='cloud',
@@ -171,13 +186,16 @@ def index():
         sync_non_event_videos=bool(_cloud.get('sync_non_event_videos', False)),
         cloud_auto_cleanup=bool(_cloud.get('cloud_auto_cleanup', False)),
         cloud_min_retention_days=int(_cloud.get('cloud_min_retention_days', 30)),
-        les_enabled=les_enabled,
-        les_watch_folders=les_watch_folders,
-        les_upload_scope=les_upload_scope,
-        les_retry_max_attempts=les_retry_max_attempts,
-        les_retry_backoff_seconds=les_retry_backoff_seconds,
-        les_daily_data_cap_mb=les_daily_data_cap_mb,
-        les_notify_webhook_url=les_notify_webhook_url,
+        # Phase 2.6 — bulk cloud sync retry cap. Default 5, range 1-20.
+        # Settings save writes to ``cloud_archive.retry_max_attempts``;
+        # the worker re-reads the value on every failure so a Settings
+        # change takes effect on the next iteration without restart.
+        cloud_retry_max_attempts=int(_cloud.get('retry_max_attempts', 5)),
+        # Phase 1 item 1.3 — retention-respects-cloud toggle + counter.
+        # ``keep_clips_until_synced`` is the UI-friendly inversion of the
+        # backend ``cloud_archive.delete_unsynced`` config key.
+        keep_clips_until_synced=_resolve_keep_clips_until_synced(_cloud),
+        kept_unsynced_count=_get_last_prune_kept_unsynced_count(),
         **ctx,
     )
 
@@ -190,16 +208,35 @@ def index():
 def save_settings():
     """Save cloud sync settings from form submission."""
     try:
-        sync_folders = request.form.getlist('sync_folders')
+        from config import _normalize_cloud_folder_list, _CLOUD_DEFAULT_FOLDERS
+        # Form posts the raw checkbox values; run them through the same
+        # allow-list + RecentClips-rewrite as the boot-time loader so a
+        # stale browser cache (or a hand-crafted POST) can never persist
+        # an unsupported folder name to config.yaml.
+        sync_folders = _normalize_cloud_folder_list(
+            request.form.getlist('sync_folders'), _CLOUD_DEFAULT_FOLDERS,
+        )
         priority_raw = request.form.get('priority_order', '')
-        priority_order = [p.strip() for p in priority_raw.split(',') if p.strip()]
+        priority_order = _normalize_cloud_folder_list(
+            [p.strip() for p in priority_raw.split(',') if p.strip()],
+            sync_folders,
+        )
         max_upload_mbps = int(request.form.get('max_upload_mbps', 5))
         cloud_reserve_gb = max(0, float(request.form.get('cloud_reserve_gb', 1)))
         sync_non_event = 'sync_non_event_videos' in request.form
         auto_cleanup = 'cloud_auto_cleanup' in request.form
         min_retention = max(1, int(request.form.get('cloud_min_retention_days', 30)))
+        # Phase 2.6 — clamp to 1-20 to match the UI input min/max and the
+        # service's _RETRY_MAX_ATTEMPTS_MIN/MAX. A value outside this
+        # range from a hand-crafted form submission falls back to the
+        # default (5) rather than disabling the cap entirely.
+        try:
+            _raw_retry = int(request.form.get('cloud_retry_max_attempts', 5))
+        except (TypeError, ValueError):
+            _raw_retry = 5
+        cloud_retry_max_attempts = max(1, min(20, _raw_retry))
 
-        _update_config_yaml({
+        config_updates = {
             'cloud_archive.sync_folders': sync_folders,
             'cloud_archive.priority_order': priority_order,
             'cloud_archive.max_upload_mbps': max_upload_mbps,
@@ -207,11 +244,47 @@ def save_settings():
             'cloud_archive.sync_non_event_videos': sync_non_event,
             'cloud_archive.cloud_auto_cleanup': auto_cleanup,
             'cloud_archive.cloud_min_retention_days': min_retention,
-        })
+            'cloud_archive.retry_max_attempts': cloud_retry_max_attempts,
+        }
+
+        # Phase 1 item 1.3 — UI toggle is positive-framed
+        # ("keep_clips_until_synced"), backend key is its inverse
+        # ("delete_unsynced"). Only persist when a cloud provider is
+        # connected: when no provider is configured the template renders
+        # the toggle disabled (browsers do not submit disabled
+        # checkboxes), so the form won't carry the user's intended
+        # state. Writing ``delete_unsynced=true`` in that case would
+        # silently override the documented null/auto-default and break
+        # the auto-protection promised when the user later connects a
+        # provider. PR #96 review fix.
+        #
+        # Provider-connected check mirrors the GET handler at L160:
+        # provider name from cloud_archive.provider in YAML AND a
+        # creds file actually present on disk.
+        try:
+            _cloud_cfg = _get_cloud_config_cached()
+            _provider = (_cloud_cfg.get('provider', '') or '').strip()
+        except Exception:  # noqa: BLE001
+            _provider = ''
+        provider_connected = bool(_provider) and os.path.isfile(
+            CLOUD_PROVIDER_CREDS_PATH
+        )
+
+        delete_unsynced = None  # for log line
+        if provider_connected:
+            keep_until_synced = 'keep_clips_until_synced' in request.form
+            delete_unsynced = not keep_until_synced
+            config_updates['cloud_archive.delete_unsynced'] = delete_unsynced
+
+        _update_config_yaml(config_updates)
 
         flash("Cloud sync settings saved.", "success")
-        logger.info("Cloud sync settings updated: folders=%s, priority=%s, bw=%d Mbps",
-                     sync_folders, priority_order, max_upload_mbps)
+        logger.info(
+            "Cloud sync settings updated: folders=%s, priority=%s, "
+            "bw=%d Mbps, delete_unsynced=%s (provider_connected=%s)",
+            sync_folders, priority_order, max_upload_mbps,
+            delete_unsynced, provider_connected,
+        )
     except Exception:
         logger.exception("Failed to save cloud sync settings")
         flash("Error saving cloud sync settings.", "danger")
@@ -237,6 +310,43 @@ def api_sync_now():
         return jsonify({"success": ok, "message": msg})
     except Exception as exc:
         logger.exception("Failed to start cloud sync")
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
+@cloud_archive_bp.route('/api/wake', methods=['POST'])
+def api_wake():
+    """Wake the continuous cloud archive worker.
+
+    Phase 3b (#99): the lightweight version of ``/api/sync_now`` for
+    producers that just want to nudge the worker without forcing a
+    full ``start_sync`` flow. Used by the NetworkManager dispatcher
+    on WiFi reconnect, the file watcher on new mp4 arrival, and any
+    other context where "the worker should re-check the queue
+    soon" is the right semantic.
+
+    Returns 200 + ``{enabled, worker_running, wake_count}`` on
+    success. The caller can poll ``/cloud/api/sync_status`` to
+    observe the resulting drain.
+    """
+    from services.cloud_archive_service import (
+        wake, get_sync_status,
+    )
+    # NOTE: ``CLOUD_ARCHIVE_ENABLED`` guard is enforced by the
+    # blueprint's ``_require_cloud_archive`` ``before_request`` hook
+    # (returns 503 for AJAX, redirect+flash for browser). No inline
+    # check needed here.
+    try:
+        wake()
+        st = get_sync_status()
+        return jsonify({
+            "success": True,
+            "enabled": True,
+            "worker_running": st.get("worker_running", False),
+            "wake_count": st.get("wake_count", 0),
+            "drain_running": st.get("running", False),
+        })
+    except Exception as exc:
+        logger.exception("Failed to wake cloud archive worker")
         return jsonify({"success": False, "message": str(exc)}), 500
 
 
@@ -299,6 +409,42 @@ def api_history():
         return jsonify({"error": str(exc)}), 500
 
 
+@cloud_archive_bp.route('/api/reset_stats', methods=['POST'])
+def api_reset_stats():
+    """Reset the dashboard counter baseline.
+
+    Non-destructive: the underlying ``cloud_synced_files`` rows are
+    preserved so already-uploaded clips stay deduped and are NEVER
+    re-uploaded on the next sync pass. Only the displayed cumulative
+    counters (``total_synced`` count and ``total_bytes`` sum) start
+    over from zero. ``total_pending`` and ``total_failed`` are
+    unaffected because they reflect current work / failures, not
+    cumulative history.
+
+    Invalidates the 10-second ``api_status`` cache so the UI sees the
+    reset reflected on the next poll instead of waiting up to 10 s.
+    """
+    from services.cloud_archive_service import reset_stats_baseline
+
+    try:
+        ok, payload = reset_stats_baseline(CLOUD_ARCHIVE_DB_PATH)
+        if not ok:
+            return jsonify({"success": False, "message": payload}), 500
+
+        # Drop the cached stats so the next poll reflects the reset
+        if hasattr(api_status, '_cache'):
+            try:
+                del api_status._cache
+            except AttributeError:
+                pass
+
+        logger.info("Cloud sync stats counters reset by user (baseline=%s)", payload)
+        return jsonify({"success": True, "stats_baseline_at": payload})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to reset cloud sync stats counters")
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+
 
 @cloud_archive_bp.route('/api/provider', methods=['POST'])
 def api_save_provider():
@@ -323,25 +469,116 @@ def api_save_provider():
 
 @cloud_archive_bp.route('/api/connect', methods=['POST'])
 def api_connect_provider():
-    """Save rclone authorize token for a cloud provider.
+    """Save credentials for a cloud provider.
 
-    Expects JSON: { "provider": "onedrive", "token": "<pasted blob>" }
+    Three accepted payload shapes:
+
+    1. **OAuth token paste** (legacy — OneDrive / Google Drive / Dropbox)::
+
+           {"provider": "onedrive", "token": "<rclone authorize blob>"}
+
+    2. **Generic — pasted ``rclone.conf`` block** (issue #165)::
+
+           {"provider": "generic", "config_block": "[my-nas]\\ntype=sftp\\n..."}
+
+    3. **Generic — inline form** (issue #165)::
+
+           {
+             "provider": "generic",
+             "rclone_type": "sftp",
+             "fields": {"host": "nas.local", "user": "pi", "pass": "..."},
+             "obscure_keys": ["pass"]
+           }
+
+    For shape (3), ``obscure_keys`` is optional; if omitted the
+    backend's documented defaults from
+    :data:`services.cloud_rclone_service._DEFAULT_OBSCURE_KEYS` are
+    applied (``["pass"]`` for ``sftp``/``webdav``/``smb``/``ftp``;
+    ``[]`` for ``s3``/``b2``/``wasabi``/``azureblob``/``swift`` since
+    rclone does not obscure their secret keys).
+
+    Behaviour notes:
+        * On success the chosen provider is persisted to
+          ``cloud_archive.provider`` in ``config.yaml`` (always
+          ``"generic"`` for shapes 2 and 3) so that on the next boot
+          ``CLOUD_ARCHIVE_PROVIDER`` resolves correctly.
+        * Shapes 2 and 3 reject any backend type outside
+          ``_GENERIC_RCLONE_TYPES`` — see
+          :func:`services.cloud_rclone_service.parse_rclone_config_block`.
     """
     from services.cloud_rclone_service import (
-        parse_rclone_token, save_credentials, PROVIDERS,
+        parse_rclone_token, parse_rclone_config_block,
+        save_credentials, save_credentials_generic, PROVIDERS,
+        _DEFAULT_OBSCURE_KEYS,
     )
 
     data = request.get_json(silent=True) or {}
     provider = data.get('provider', '')
-    token_raw = data.get('token', '')
 
-    if not provider or not token_raw:
+    if not provider:
         return jsonify({"success": False,
-                        "message": "Missing provider or token."}), 400
-
+                        "message": "Missing provider."}), 400
     if provider not in PROVIDERS:
         return jsonify({"success": False,
                         "message": f"Unknown provider: {provider}"}), 400
+
+    # ----- Shape 2 / 3: generic rclone remote (#165) --------------------
+    if provider == 'generic':
+        config_block = data.get('config_block')
+        rclone_type = data.get('rclone_type')
+        fields = data.get('fields')
+
+        try:
+            if config_block:
+                parsed = parse_rclone_config_block(config_block)
+                rt = parsed.pop('type')
+                # Default obscure keys come from the single source of
+                # truth in cloud_rclone_service so a future backend
+                # added to _GENERIC_RCLONE_TYPES can never silently
+                # default to no-obscure here (PR #218 review I-3).
+                obscure_keys = data.get(
+                    'obscure_keys', _DEFAULT_OBSCURE_KEYS.get(rt, []),
+                )
+                save_credentials_generic(
+                    rt, parsed,
+                    obscure_keys=obscure_keys, source='paste',
+                )
+            elif rclone_type and isinstance(fields, dict):
+                obscure_keys = data.get(
+                    'obscure_keys',
+                    _DEFAULT_OBSCURE_KEYS.get(rclone_type, []),
+                )
+                save_credentials_generic(
+                    rclone_type, fields,
+                    obscure_keys=obscure_keys, source='form',
+                )
+            else:
+                return jsonify({"success": False, "message": (
+                    "Generic provider requires either 'config_block' "
+                    "or both 'rclone_type' and 'fields'."
+                )}), 400
+        except ValueError as e:
+            return jsonify({"success": False, "message": str(e)}), 400
+        except RuntimeError as e:
+            logger.exception("rclone obscure failed")
+            return jsonify({"success": False, "message": str(e)}), 500
+        except Exception as exc:
+            logger.exception("Failed to save generic cloud credentials")
+            return jsonify({"success": False, "message": str(exc)}), 500
+
+        try:
+            _update_config_yaml({'cloud_archive.provider': 'generic'})
+            return jsonify({"success": True,
+                            "message": "Connected successfully."})
+        except Exception as exc:
+            logger.exception("Failed to persist provider selection")
+            return jsonify({"success": False, "message": str(exc)}), 500
+
+    # ----- Shape 1: OAuth token paste (legacy) --------------------------
+    token_raw = data.get('token', '')
+    if not token_raw:
+        return jsonify({"success": False,
+                        "message": "Missing token."}), 400
 
     try:
         token = parse_rclone_token(token_raw)
@@ -568,14 +805,50 @@ def api_queue_clear():
 
 @cloud_archive_bp.route('/api/archive_cleanup', methods=['POST'])
 def api_archive_cleanup():
-    """Manually trigger smart archive cleanup."""
+    """Manually trigger archive retention prune.
+
+    Phase 3a (#98 / closes #91): this endpoint is now a thin wrapper
+    around ``archive_watchdog.force_prune_now`` (via the
+    ``video_archive_service.trigger_archive_cleanup`` shim). The legacy
+    ``smart_cleanup_archive`` / ``_proactive_retention`` /
+    ``_enforce_retention`` cascade has been deleted — retention is
+    owned by ``archive_watchdog``.
+
+    HTTP contract preserved across the refactor:
+      * 200 + ``{"success": True, "result": {...}}`` on a successful
+        prune (including the watchdog's ``status='already_running'``
+        short-circuit, which is a normal control-flow signal — NOT
+        an error).
+      * 500 + ``{"success": False, "message": ...}`` when the
+        retention call itself fails. The shim swallows the
+        underlying exception and returns a structured error dict
+        with an ``error`` key; we re-raise that as a 500 so external
+        callers / automation that key on HTTP status keep working.
+
+    New callers should use ``POST /api/archive/prune_now`` directly;
+    this endpoint is kept for backwards compatibility with any
+    external automation.
+    """
     from services.video_archive_service import trigger_archive_cleanup
     try:
         result = trigger_archive_cleanup()
-        return jsonify({"success": True, "result": result})
     except Exception as exc:
         logger.exception("Failed to run archive cleanup")
         return jsonify({"success": False, "message": str(exc)}), 500
+
+    if isinstance(result, dict) and result.get("error"):
+        # The shim handled the exception internally and returned a
+        # structured error dict. Surface this as the legacy 500 so
+        # callers that check HTTP status (or the top-level
+        # ``success`` flag) continue to treat watchdog crashes as
+        # failures, not silent successes.
+        return jsonify({
+            "success": False,
+            "message": result["error"],
+            "result": result,
+        }), 500
+
+    return jsonify({"success": True, "result": result})
 
 
 # ---------------------------------------------------------------------------

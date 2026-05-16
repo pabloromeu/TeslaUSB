@@ -16,17 +16,40 @@ from services.mapping_service import (
     _detect_events,
     _debounce_events,
     _haversine_km,
-    _haversine_m,
-    _is_gap_between,
-    _parse_iso_seconds,
-    GAP_MAX_SECONDS_DEFAULT,
-    GAP_MAX_METERS_DEFAULT,
     _timestamp_from_filename,
     _find_front_camera_videos,
     _index_video,
     boot_catchup_scan,
     canonical_key,
     candidate_db_paths,
+    index_single_file,
+    IndexOutcome,
+    IndexResult,
+    start_daily_stale_scan,
+    stop_daily_stale_scan,
+    trigger_stale_scan_now,
+    _initial_stale_scan_delay,
+    _run_stale_scan_blocking,
+    _reset_stale_scan_state_for_tests,
+    DEFAULT_THRESHOLDS,
+    _SCHEMA_VERSION,
+)
+from services.mapping_queries import (
+    _haversine_m,
+    _is_gap_between,
+    _parse_iso_seconds,
+    GAP_MAX_SECONDS_DEFAULT,
+    GAP_MAX_METERS_DEFAULT,
+    query_days,
+    query_day_routes,
+    query_trips,
+    query_trip_route,
+    query_events,
+    get_stats,
+    get_driving_stats,
+    get_event_chart_data,
+)
+from services.indexing_queue_service import (
     claim_next_queue_item,
     clear_all_queue,
     clear_pending_queue,
@@ -37,32 +60,13 @@ from services.mapping_service import (
     enqueue_for_indexing,
     enqueue_many_for_indexing,
     get_queue_status,
-    index_single_file,
-    IndexOutcome,
-    IndexResult,
     priority_for_path,
-    query_days,
-    query_day_routes,
-    query_trips,
-    query_trip_route,
-    query_events,
-    get_stats,
-    get_driving_stats,
-    get_event_chart_data,
     recover_stale_claims,
     release_claim,
-    start_daily_stale_scan,
-    stop_daily_stale_scan,
-    trigger_stale_scan_now,
-    _initial_stale_scan_delay,
-    _run_stale_scan_blocking,
-    _reset_stale_scan_state_for_tests,
-    DEFAULT_THRESHOLDS,
     _PARSE_ERROR_MAX_ATTEMPTS,
     _PRIORITY_ARCHIVE,
     _PRIORITY_RECENT,
     _PRIORITY_SENTRY_SAVED,
-    _SCHEMA_VERSION,
 )
 from services.dashcam_pb2 import SeiMetadata
 
@@ -193,6 +197,176 @@ class TestDatabase:
         fk = conn.execute("PRAGMA foreign_keys").fetchone()[0]
         assert fk == 1
         conn.close()
+
+
+class TestArchiveQueueSchema:
+    """v9 → v10 migration adds the ``archive_queue`` table + ready index.
+
+    These tests verify the migration is forward-compatible (creates the
+    new table on a fresh DB), idempotent (re-running ``_init_db`` is a
+    no-op), and non-destructive (existing rows in trips / waypoints /
+    detected_events / indexed_files / indexing_queue survive the
+    migration).
+    """
+
+    def test_archive_queue_table_exists_after_init(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        conn = _init_db(db_path)
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        assert 'archive_queue' in tables
+        conn.close()
+
+    def test_archive_queue_ready_index_exists(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        conn = _init_db(db_path)
+        indexes = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()]
+        assert 'archive_queue_ready' in indexes
+        conn.close()
+
+    def test_archive_queue_columns_match_spec(self, tmp_path):
+        """All 13 columns from the issue spec must be present with the
+        correct types and defaults."""
+        db_path = str(tmp_path / "test.db")
+        conn = _init_db(db_path)
+        cols = {r[1]: r for r in conn.execute(
+            "PRAGMA table_info(archive_queue)"
+        ).fetchall()}
+        # Column name: (type, notnull, dflt_value, pk)
+        # cid(0), name(1), type(2), notnull(3), dflt_value(4), pk(5)
+        assert 'id' in cols and cols['id'][5] == 1  # PK
+        assert 'source_path' in cols
+        assert cols['source_path'][2] == 'TEXT'
+        assert cols['source_path'][3] == 1  # NOT NULL
+        assert 'dest_path' in cols
+        assert 'priority' in cols
+        assert cols['priority'][4] == '3'  # default 3
+        assert 'status' in cols
+        assert cols['status'][4] == "'pending'"
+        assert 'attempts' in cols
+        assert cols['attempts'][4] == '0'
+        assert 'last_error' in cols
+        assert 'enqueued_at' in cols
+        assert cols['enqueued_at'][3] == 1  # NOT NULL
+        assert 'claimed_at' in cols
+        assert 'claimed_by' in cols
+        assert 'copied_at' in cols
+        assert 'expected_size' in cols
+        assert 'expected_mtime' in cols
+        assert cols['expected_mtime'][2] == 'REAL'
+        conn.close()
+
+    def test_source_path_unique_constraint(self, tmp_path):
+        """``source_path`` must enforce UNIQUE so dedup is automatic."""
+        db_path = str(tmp_path / "test.db")
+        conn = _init_db(db_path)
+        conn.execute(
+            "INSERT INTO archive_queue (source_path, enqueued_at) "
+            "VALUES (?, ?)",
+            ('/a/b.mp4', '2026-05-11T09:00:00+00:00'),
+        )
+        conn.commit()
+        # Second insert with same source_path raises IntegrityError.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO archive_queue (source_path, enqueued_at) "
+                "VALUES (?, ?)",
+                ('/a/b.mp4', '2026-05-11T09:01:00+00:00'),
+            )
+        conn.close()
+
+    def test_schema_version_is_v10(self, tmp_path):
+        from services.mapping_service import _SCHEMA_VERSION
+        # Phase 2a bumps the schema to v10.
+        assert _SCHEMA_VERSION >= 10
+
+    def test_migration_is_idempotent(self, tmp_path):
+        """Running ``_init_db`` twice must not lose archive_queue rows."""
+        db_path = str(tmp_path / "test.db")
+        conn = _init_db(db_path)
+        conn.execute(
+            "INSERT INTO archive_queue (source_path, enqueued_at) "
+            "VALUES (?, ?)",
+            ('/keep/me.mp4', '2026-05-11T09:00:00+00:00'),
+        )
+        conn.commit()
+        conn.close()
+
+        # Re-init the same DB. Must preserve the row.
+        conn2 = _init_db(db_path)
+        n = conn2.execute(
+            "SELECT COUNT(*) FROM archive_queue"
+        ).fetchone()[0]
+        assert n == 1
+        row = conn2.execute(
+            "SELECT source_path FROM archive_queue"
+        ).fetchone()
+        assert row[0] == '/keep/me.mp4'
+        conn2.close()
+
+    def test_migration_preserves_existing_data(self, tmp_path):
+        """Pre-existing trips / waypoints / detected_events / indexed_files
+        must survive the migration to v10 unchanged."""
+        db_path = str(tmp_path / "test.db")
+        conn = _init_db(db_path)
+        # Seed data in the older tables.
+        conn.execute(
+            "INSERT INTO trips (start_time, end_time) VALUES (?, ?)",
+            ('2025-01-01T00:00:00', '2025-01-01T01:00:00'),
+        )
+        trip_id = conn.execute(
+            "SELECT id FROM trips ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        conn.execute(
+            """INSERT INTO waypoints
+                (trip_id, timestamp, lat, lon)
+               VALUES (?, ?, ?, ?)""",
+            (trip_id, '2025-01-01T00:30:00', 37.7749, -122.4194),
+        )
+        conn.execute(
+            """INSERT INTO indexed_files
+                (file_path, indexed_at)
+               VALUES (?, ?)""",
+            ('/tmp/x.mp4', '2025-01-01T00:00:00'),
+        )
+        conn.commit()
+        conn.close()
+
+        # Re-init (no-op for v10) and verify rows are untouched.
+        conn2 = _init_db(db_path)
+        assert conn2.execute(
+            "SELECT COUNT(*) FROM trips"
+        ).fetchone()[0] == 1
+        assert conn2.execute(
+            "SELECT COUNT(*) FROM waypoints"
+        ).fetchone()[0] == 1
+        assert conn2.execute(
+            "SELECT COUNT(*) FROM indexed_files"
+        ).fetchone()[0] == 1
+        conn2.close()
+
+    def test_indexing_queue_unaffected_by_v10(self, tmp_path):
+        """The Phase 2a migration must not touch indexing_queue rows."""
+        db_path = str(tmp_path / "test.db")
+        conn = _init_db(db_path)
+        conn.execute(
+            """INSERT INTO indexing_queue
+                (canonical_key, file_path, priority, enqueued_at)
+               VALUES (?, ?, ?, ?)""",
+            ('keyA', '/tmp/y.mp4', 50, 1700000000.0),
+        )
+        conn.commit()
+        conn.close()
+
+        conn2 = _init_db(db_path)
+        n = conn2.execute(
+            "SELECT COUNT(*) FROM indexing_queue"
+        ).fetchone()[0]
+        assert n == 1
+        conn2.close()
 
 
 # ---------------------------------------------------------------------------
@@ -970,7 +1144,7 @@ class TestQueryAllRoutesSimplified:
             )
 
     def test_all_trips_returned_ordered_newest_first(self, tmp_path):
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-03T08:00:00', distance_km=3.0)
         self._add_waypoints(conn, 1, count=4)
@@ -987,7 +1161,7 @@ class TestQueryAllRoutesSimplified:
         # The client uses ``date`` to drill into the right day on
         # polyline click — must match substr(start_time, 1, 10), the
         # same bucketing rule query_days/query_day_routes use.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T23:59:00',
                        end='2026-05-05T00:30:00', distance_km=3.0)
@@ -1000,7 +1174,7 @@ class TestQueryAllRoutesSimplified:
         # First + last waypoints anchor the polyline at the trip's
         # actual endpoints — no matter how aggressively RDP collapses
         # straight middle stretches, both endpoints must survive.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
         # 200 waypoints at lat = 37.700, 37.701, ..., 37.899 (a
@@ -1023,7 +1197,7 @@ class TestQueryAllRoutesSimplified:
         # The previous stride-based sampler returned ~N/step points
         # even on perfectly straight roads, wasting bytes for no
         # visual benefit.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=10.0)
         self._add_waypoints(conn, 1, count=500)
@@ -1036,7 +1210,7 @@ class TestQueryAllRoutesSimplified:
         # sharp turns when the corner falls inside a stride gap. RDP
         # detects the corner via its perpendicular distance from the
         # chord and forces a kept point there.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         import sqlite3
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
@@ -1080,7 +1254,7 @@ class TestQueryAllRoutesSimplified:
         # endpoints survive — that's the correct simplification, and
         # any mid-trip drilldown should drill into the per-day
         # endpoint which preserves every raw waypoint.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
         self._add_waypoints(conn, 1, count=8)
@@ -1095,7 +1269,7 @@ class TestQueryAllRoutesSimplified:
         # points, the safety cap kicks in via stride sampling. This
         # test builds a pathological zigzag where every other point
         # is a real corner so RDP has to keep them all.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
         # 40 zigzag points that alternate north/south so every
@@ -1120,7 +1294,7 @@ class TestQueryAllRoutesSimplified:
         # Same default as /api/trips and /api/day/<date>/routes —
         # the All time overlay must not advertise trips other views
         # hide as parking-lot blips.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
         self._add_waypoints(conn, 1, count=4)
@@ -1138,7 +1312,7 @@ class TestQueryAllRoutesSimplified:
         # otherwise Leaflet would draw nothing and the JSON payload
         # would just waste bandwidth. The schema enforces NOT NULL on
         # lat/lon so this guard kicks in via the <2-row count path.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
         self._add_waypoints(conn, 1, count=1)
@@ -1147,7 +1321,7 @@ class TestQueryAllRoutesSimplified:
         assert trips == []
 
     def test_trips_with_no_waypoints_excluded_by_inner_join(self, tmp_path):
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
         # Trip 1 has zero waypoints — must be excluded.
@@ -1158,7 +1332,7 @@ class TestQueryAllRoutesSimplified:
         assert [t['trip_id'] for t in trips] == [2]
 
     def test_empty_db_returns_empty_list(self, tmp_path):
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         conn.commit(); conn.close()
         assert query_all_routes_simplified(db_path) == []
@@ -1167,7 +1341,7 @@ class TestQueryAllRoutesSimplified:
         # Polyline rendering depends on the waypoints arriving in
         # the order the trip actually drove them — out-of-order
         # rows would draw a tangled mess.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
         self._add_waypoints(conn, 1, count=10)
@@ -1353,6 +1527,137 @@ class TestIndexVideo:
         # Recent-folder no-GPS clips are recorded as NO_GPS_RECORDED so the
         # queue worker can drop the row without flapping retries.
         assert result.outcome == IndexOutcome.NO_GPS_RECORDED
+        conn.close()
+
+    def test_indexed_files_fallback_dedup_when_video_path_nulled(self, tmp_path):
+        # Defense-in-depth: when ``waypoints.video_path`` was nulled by
+        # ``purge_deleted_videos`` (because a sibling copy of the clip
+        # was deleted), the primary canonical-key check on
+        # ``waypoints.video_path IN (...)`` returns no rows. Without
+        # this fallback the indexer would re-parse the clip and insert
+        # a SECOND set of waypoints + detected_events, producing the
+        # duplicate event pins we hit on May 10/11.
+        #
+        # The fallback uses ``indexed_files`` as the authoritative
+        # "we processed this physical file" record and refuses to
+        # re-index when a row exists with ``waypoint_count > 0``.
+        db_path = str(tmp_path / "test.db")
+        conn = _init_db(db_path)
+
+        payloads = [
+            _make_sei_protobuf(lat=37.7749, lon=-122.4194, speed=25.0),
+            _make_sei_protobuf(lat=37.7750, lon=-122.4195, speed=26.0),
+        ]
+        mp4_data = _make_synthetic_mp4(payloads)
+        teslacam = tmp_path / "TeslaCam" / "RecentClips"
+        teslacam.mkdir(parents=True)
+        video_file = teslacam / "2025-11-08_08-15-44-front.mp4"
+        video_file.write_bytes(mp4_data)
+
+        # First index — populates waypoints and indexed_files normally.
+        first = _index_video(
+            conn, str(video_file), str(tmp_path / "TeslaCam"),
+            sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
+            trip_gap_minutes=5,
+        )
+        assert first.outcome == IndexOutcome.INDEXED
+        assert first.waypoints == 2
+        wp_count_after_first = conn.execute(
+            "SELECT COUNT(*) FROM waypoints"
+        ).fetchone()[0]
+        assert wp_count_after_first == 2
+
+        # ``index_single_file`` (the public entry point) records the
+        # indexed_files row after ``_index_video`` returns. Simulate
+        # that here so the fallback has authoritative state to consult.
+        from datetime import datetime, timezone
+        st = video_file.stat()
+        conn.execute(
+            "INSERT OR REPLACE INTO indexed_files "
+            "(file_path, file_size, file_mtime, indexed_at, "
+            "waypoint_count, event_count) VALUES (?, ?, ?, ?, ?, ?)",
+            (str(video_file), st.st_size, st.st_mtime,
+             datetime.now(timezone.utc).isoformat(), 2, 0),
+        )
+
+        # Simulate the production data anomaly: a prior
+        # purge_deleted_videos run NULLed the video_path on every
+        # waypoint for this clip (e.g., because a sibling copy was
+        # deleted before the surviving-copy check found this one).
+        # ``indexed_files`` keeps its row — that's the asymmetry
+        # the fallback exploits.
+        conn.execute("UPDATE waypoints SET video_path = NULL")
+        conn.execute("UPDATE detected_events SET video_path = NULL")
+        conn.commit()
+
+        # Re-index the same clip. With ONLY the
+        # ``waypoints.video_path IN (...)`` dedup, this would
+        # fall through to SEI extraction and double the row count.
+        # The new fallback should return ALREADY_INDEXED.
+        second = _index_video(
+            conn, str(video_file), str(tmp_path / "TeslaCam"),
+            sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
+            trip_gap_minutes=5,
+        )
+        assert second.outcome == IndexOutcome.ALREADY_INDEXED
+        wp_count_after_second = conn.execute(
+            "SELECT COUNT(*) FROM waypoints"
+        ).fetchone()[0]
+        # Critical: NO new waypoint inserts. The pre-existing
+        # 2 rows (with NULL video_path) are intact, no duplicates
+        # added.
+        assert wp_count_after_second == 2
+        conn.close()
+
+    def test_indexed_files_fallback_does_not_overmatch_underscore(self, tmp_path):
+        # Tesla filenames contain ``_`` separators (the SQLite LIKE
+        # single-character wildcard). Without an ``ESCAPE`` clause, the
+        # fallback's ``LIKE '%basename'`` could match a different clip
+        # whose basename happens to align character-for-character with
+        # ``_`` standing in for any character. This test seeds an
+        # ``indexed_files`` row whose basename differs from the clip
+        # only at the ``_`` positions and confirms the fallback does
+        # NOT short-circuit (the indexer still runs and produces real
+        # waypoints).
+        from datetime import datetime, timezone
+        db_path = str(tmp_path / "test.db")
+        conn = _init_db(db_path)
+
+        payloads = [
+            _make_sei_protobuf(lat=37.7749, lon=-122.4194, speed=25.0),
+        ]
+        mp4_data = _make_synthetic_mp4(payloads)
+        teslacam = tmp_path / "TeslaCam" / "RecentClips"
+        teslacam.mkdir(parents=True)
+        # The clip we're about to index:
+        video_file = teslacam / "2025-11-08_08-15-44-front.mp4"
+        video_file.write_bytes(mp4_data)
+
+        # Seed an indexed_files row for a DIFFERENT clip whose basename
+        # matches the target clip's basename only if ``_`` is treated
+        # as a wildcard (every ``_`` replaced with another character).
+        # Without escaping, the naive ``LIKE '%2025-11-08_08-15-44-...'``
+        # query would mistakenly match this row.
+        impostor_basename = "2025-11-08X08-15-44-front.mp4"
+        impostor_abs = "/some/other/path/" + impostor_basename
+        conn.execute(
+            "INSERT INTO indexed_files "
+            "(file_path, file_size, file_mtime, indexed_at, "
+            "waypoint_count, event_count) VALUES (?, ?, ?, ?, ?, ?)",
+            (impostor_abs, 9999, 1.0,
+             datetime.now(timezone.utc).isoformat(), 5, 0),
+        )
+        conn.commit()
+
+        # The indexer must NOT treat the impostor row as evidence
+        # that THIS clip was already indexed. It should index normally.
+        result = _index_video(
+            conn, str(video_file), str(tmp_path / "TeslaCam"),
+            sample_rate=1, thresholds=DEFAULT_THRESHOLDS,
+            trip_gap_minutes=5,
+        )
+        assert result.outcome == IndexOutcome.INDEXED
+        assert result.waypoints == 1
         conn.close()
 
 
@@ -2035,6 +2340,301 @@ class TestIndexSingleFileOutcomes:
         if result.outcome == IndexOutcome.PARSE_ERROR:
             assert result.error is not None
             assert not result.terminal
+
+
+class TestIndexSingleFileSidecarConsumption:
+    """Issue #197: ``_index_video`` (via ``index_single_file``) must
+    prefer a sidecar JSON over a fresh mmap walk when one exists.
+    """
+
+    def _make_sidecar_with_messages(
+        self, video_path, sample_rate=30, messages=None, mvhd=None,
+    ):
+        """Hand-build a sidecar JSON the indexer should consume
+        without calling the real SEI parser. Lets us isolate the
+        indexer's sidecar branch from the rest of the parser stack."""
+        import json as _json
+        import os as _os
+        from services import sei_parser
+
+        if messages is None:
+            messages = [
+                {
+                    'frame_index': 0,
+                    'timestamp_ms': 0.0,
+                    'latitude_deg': 37.7749,
+                    'longitude_deg': -122.4194,
+                    'heading_deg': 90.0,
+                    'vehicle_speed_mps': 25.0,
+                    'linear_acceleration_x': 0.1,
+                    'linear_acceleration_y': 0.0,
+                    'linear_acceleration_z': -0.1,
+                    'steering_wheel_angle': 0.5,
+                    'accelerator_pedal_position': 0.2,
+                    'brake_applied': False,
+                    'gear_state': 'DRIVE',
+                    'autopilot_state': 'NONE',
+                    'blinker_on_left': False,
+                    'blinker_on_right': False,
+                    'frame_seq_no': 0,
+                },
+            ]
+        st = _os.stat(video_path)
+        payload = {
+            'schema_version': sei_parser.SIDECAR_SCHEMA_VERSION,
+            'sample_rate': sample_rate,
+            'sei_count': len(messages),
+            'no_gps_count': 0,
+            'mvhd_creation_time_utc': mvhd,
+            'video_size_bytes': st.st_size,
+            'video_mtime_unix': st.st_mtime,
+            'messages': messages,
+        }
+        with open(sei_parser.sidecar_path_for(video_path), 'w',
+                  encoding='utf-8') as f:
+            _json.dump(payload, f)
+
+    def test_index_consumes_sidecar_without_mmap_walk(
+        self, tmp_path, monkeypatch,
+    ):
+        """When a valid sidecar exists, ``_index_video`` must NOT
+        call ``parser.extract_sei_messages`` — proves the sidecar
+        path is short-circuiting the mmap walk."""
+        import os as _os
+        import time as _time
+        from services import sei_parser
+
+        db = str(tmp_path / "geo.db")
+        _init_db(db)
+        clip = tmp_path / "2025-11-08_08-15-44-front.mp4"
+        clip.write_bytes(b'\x00' * 64)
+        old = _time.time() - 600
+        _os.utime(str(clip), (old, old))
+
+        self._make_sidecar_with_messages(str(clip))
+
+        # Sentinel: explode if extract_sei_messages is touched.
+        called: list = []
+
+        def _exploder(*a, **kw):
+            called.append((a, kw))
+            raise AssertionError(
+                "extract_sei_messages was called even though a "
+                "valid sidecar exists — sidecar fast-path is broken."
+            )
+
+        monkeypatch.setattr(
+            sei_parser, 'extract_sei_messages', _exploder,
+        )
+
+        result = index_single_file(
+            str(clip), db, str(tmp_path), sample_rate=30,
+        )
+        assert result.outcome == IndexOutcome.INDEXED
+        assert result.waypoints == 1
+        assert called == []
+
+    def test_index_falls_back_to_mmap_when_sidecar_missing(
+        self, tmp_path, monkeypatch,
+    ):
+        """Without a sidecar, the indexer must transparently fall
+        back to ``extract_sei_messages``. Pre-issue-#197 baseline
+        path — must continue to work for clips that pre-date the
+        sidecar feature or for clips whose sidecar was lost."""
+        import os as _os
+        import time as _time
+        from services import sei_parser
+
+        db = str(tmp_path / "geo.db")
+        _init_db(db)
+        clip = tmp_path / "2025-11-08_08-15-44-front.mp4"
+        clip.write_bytes(b'\x00' * 64)
+        old = _time.time() - 600
+        _os.utime(str(clip), (old, old))
+
+        # No sidecar created. Stub extract_sei_messages with a
+        # synthetic generator so the test doesn't need a real MP4.
+        called: list = []
+
+        def _gen(video_path, sample_rate):
+            called.append((video_path, sample_rate))
+            yield sei_parser.SeiMessage(
+                frame_index=0, timestamp_ms=0.0,
+                latitude_deg=37.7749, longitude_deg=-122.4194,
+                heading_deg=90.0, vehicle_speed_mps=25.0,
+                linear_acceleration_x=0.0, linear_acceleration_y=0.0,
+                linear_acceleration_z=0.0,
+                steering_wheel_angle=0.0, accelerator_pedal_position=0.0,
+                brake_applied=False,
+                gear_state='DRIVE', autopilot_state='NONE',
+                blinker_on_left=False, blinker_on_right=False,
+                frame_seq_no=0, video_path=video_path,
+            )
+
+        monkeypatch.setattr(sei_parser, 'extract_sei_messages', _gen)
+
+        result = index_single_file(
+            str(clip), db, str(tmp_path), sample_rate=30,
+        )
+        assert result.outcome == IndexOutcome.INDEXED
+        assert called and called[0][1] == 30, (
+            "extract_sei_messages was not called on the fallback "
+            "path — indexer would have produced no waypoints."
+        )
+
+    def test_index_falls_back_to_mmap_on_sidecar_size_drift(
+        self, tmp_path, monkeypatch,
+    ):
+        """Drift detection: sidecar's recorded size differs from
+        the live file's size → ``read_sei_sidecar`` returns None →
+        indexer mmap-parses."""
+        import os as _os
+        import time as _time
+        from services import sei_parser
+
+        db = str(tmp_path / "geo.db")
+        _init_db(db)
+        clip = tmp_path / "2025-11-08_08-15-44-front.mp4"
+        clip.write_bytes(b'\x00' * 64)
+        old = _time.time() - 600
+        _os.utime(str(clip), (old, old))
+
+        # Sidecar describes the file as it is now …
+        self._make_sidecar_with_messages(str(clip))
+        # … then we overwrite with a different size (post-sidecar
+        # write). Drift → invalidation → fallback.
+        with open(str(clip), 'ab') as f:
+            f.write(b'\x00' * 1024)
+        _os.utime(str(clip), (old, old))
+
+        called: list = []
+
+        def _gen(video_path, sample_rate):
+            called.append(True)
+            yield sei_parser.SeiMessage(
+                frame_index=0, timestamp_ms=0.0,
+                latitude_deg=37.0, longitude_deg=-122.0,
+                heading_deg=0.0, vehicle_speed_mps=10.0,
+                linear_acceleration_x=0.0, linear_acceleration_y=0.0,
+                linear_acceleration_z=0.0,
+                steering_wheel_angle=0.0, accelerator_pedal_position=0.0,
+                brake_applied=False, gear_state='DRIVE',
+                autopilot_state='NONE',
+                blinker_on_left=False, blinker_on_right=False,
+                frame_seq_no=0, video_path=video_path,
+            )
+
+        monkeypatch.setattr(sei_parser, 'extract_sei_messages', _gen)
+
+        result = index_single_file(
+            str(clip), db, str(tmp_path), sample_rate=30,
+        )
+        assert result.outcome == IndexOutcome.INDEXED
+        assert called == [True], (
+            "Indexer did not fall back to mmap parse despite "
+            "sidecar size-drift invalidation — would silently "
+            "use stale data."
+        )
+
+    def test_index_falls_back_when_sample_rate_mismatches(
+        self, tmp_path, monkeypatch,
+    ):
+        """If the cached sidecar was written at a different
+        sample_rate than the indexer is requesting, the
+        ``required_sample_rate`` guard invalidates the sidecar."""
+        import os as _os
+        import time as _time
+        from services import sei_parser
+
+        db = str(tmp_path / "geo.db")
+        _init_db(db)
+        clip = tmp_path / "2025-11-08_08-15-44-front.mp4"
+        clip.write_bytes(b'\x00' * 64)
+        old = _time.time() - 600
+        _os.utime(str(clip), (old, old))
+
+        # Sidecar at sample_rate=1; indexer asks for 30 → mismatch.
+        self._make_sidecar_with_messages(str(clip), sample_rate=1)
+
+        called: list = []
+
+        def _gen(video_path, sample_rate):
+            called.append(sample_rate)
+            yield sei_parser.SeiMessage(
+                frame_index=0, timestamp_ms=0.0,
+                latitude_deg=37.0, longitude_deg=-122.0,
+                heading_deg=0.0, vehicle_speed_mps=10.0,
+                linear_acceleration_x=0.0, linear_acceleration_y=0.0,
+                linear_acceleration_z=0.0,
+                steering_wheel_angle=0.0, accelerator_pedal_position=0.0,
+                brake_applied=False, gear_state='DRIVE',
+                autopilot_state='NONE',
+                blinker_on_left=False, blinker_on_right=False,
+                frame_seq_no=0, video_path=video_path,
+            )
+
+        monkeypatch.setattr(sei_parser, 'extract_sei_messages', _gen)
+
+        result = index_single_file(
+            str(clip), db, str(tmp_path), sample_rate=30,
+        )
+        assert result.outcome == IndexOutcome.INDEXED
+        assert called == [30]
+
+
+class TestPurgeDeletedVideosSidecar:
+    """Issue #197: ``purge_deleted_videos`` must delete the SEI
+    sidecar JSON alongside the indexed_files row, so a deleted
+    .mp4 doesn't leave dead sidecar weight in the directory."""
+
+    def test_purge_deletes_sidecar(self, tmp_path):
+        from services import sei_parser
+        from services.mapping_service import (
+            _init_db, purge_deleted_videos,
+        )
+
+        db = str(tmp_path / "geo.db")
+        _init_db(db).close()
+
+        clip = tmp_path / "2025-11-08_08-15-44-front.mp4"
+        clip.write_bytes(b'\x00' * 64)
+        sidecar_path = sei_parser.sidecar_path_for(str(clip))
+        # Hand-create a fake sidecar — content doesn't matter; we
+        # only assert it's gone after purge.
+        with open(sidecar_path, 'w', encoding='utf-8') as f:
+            f.write('{}')
+        assert os.path.isfile(sidecar_path)
+
+        # Pretend the .mp4 is gone (the watcher's normal fire path).
+        clip.unlink()
+
+        result = purge_deleted_videos(
+            db, deleted_paths=[str(clip)],
+        )
+        assert result['purged_files'] == 0  # no indexed_files row
+        assert not os.path.isfile(sidecar_path), (
+            "Sidecar was not deleted alongside the .mp4 — "
+            "would accumulate as dead weight in the directory."
+        )
+
+    def test_purge_handles_missing_sidecar(self, tmp_path):
+        """A clip whose sidecar never existed (pre-#197 file, or
+        sidecar write failed) must not break purge."""
+        from services.mapping_service import (
+            _init_db, purge_deleted_videos,
+        )
+
+        db = str(tmp_path / "geo.db")
+        _init_db(db).close()
+
+        clip = tmp_path / "2025-11-08_08-15-44-front.mp4"
+        clip.write_bytes(b'\x00')
+        clip.unlink()
+
+        result = purge_deleted_videos(
+            db, deleted_paths=[str(clip)],
+        )
+        assert result['purged_files'] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2876,35 +3476,68 @@ class TestPurgeDeletedVideos:
 
 
 class TestBootCatchupScan:
-    def _make_teslacam(self, root, files):
-        """Create a fake TeslaCam tree with the given relative paths."""
+    """Phase 2b (issue #76): boot_catchup_scan now walks ONLY
+    ``ARCHIVE_DIR`` (the SD-card ArchivedClips), never the RO USB
+    mount. The USB-side catch-up is handled by the
+    ``archive_producer`` thread, which enqueues into ``archive_queue``;
+    the worker then copies into ArchivedClips, where THIS catch-up
+    finds them on the next gadget_web start.
+
+    The legacy test signature ``boot_catchup_scan(db, tc)`` still
+    accepts the ``tc`` argument for back-compat, but it's now ignored.
+    All these tests populate ARCHIVE_DIR via monkeypatch instead.
+    """
+    def _make_archive(self, root, files):
+        """Create a fake ArchivedClips tree with the given relative paths."""
         for rel in files:
             full = root / rel
             full.parent.mkdir(parents=True, exist_ok=True)
             full.write_bytes(b'')
         return str(root)
 
+    def _make_teslacam(self, root, files):
+        """Compatibility helper kept so the dedup test below still works
+        (the test populates BOTH ArchivedClips and a legacy TeslaCam
+        tree, then verifies that only the ArchivedClips side gets
+        enqueued)."""
+        for rel in files:
+            full = root / rel
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_bytes(b'')
+        return str(root)
+
+    @pytest.fixture(autouse=True)
+    def _patch_archive_dir(self, tmp_path, monkeypatch):
+        """Point ARCHIVE_DIR at a per-test tmpdir so the scanner sees
+        a clean slate. This must run BEFORE each test populates files."""
+        archive_root = tmp_path / "ArchivedClips"
+        archive_root.mkdir()
+        import config as _cfg
+        monkeypatch.setattr(_cfg, 'ARCHIVE_DIR', str(archive_root))
+        monkeypatch.setattr(_cfg, 'ARCHIVE_ENABLED', True)
+        self._archive_root = archive_root
+
     def test_no_files_returns_zero_counts(self, tmp_path):
         db = str(tmp_path / "g.db")
         _init_db(db)
-        tc = self._make_teslacam(tmp_path / "TeslaCam", [])
-        result = boot_catchup_scan(db, tc)
-        assert result == {'scanned': 0, 'already_indexed': 0, 'enqueued': 0}
+        result = boot_catchup_scan(db, '')
+        assert result == {
+            'scanned': 0, 'already_indexed': 0, 'enqueued': 0,
+            'skipped_by_watermark': 0,
+        }
 
     def test_enqueues_orphan_clips(self, tmp_path):
         db = str(tmp_path / "g.db")
         _init_db(db)
-        tc = self._make_teslacam(tmp_path / "TeslaCam", [
+        # Populate the ArchivedClips tree with three distinct
+        # canonical_keys: a flat RecentClips file, a SavedClips event
+        # folder file, and a SentryClips event folder file.
+        self._make_archive(self._archive_root, [
             'RecentClips/2025-11-08_08-15-44-front.mp4',
             'SavedClips/2025-11-08_evt/2025-11-08_08-15-44-front.mp4',
             'SentryClips/2025-11-08_evt2/2025-11-08_08-20-00-front.mp4',
         ])
-        result = boot_catchup_scan(db, tc)
-        # SavedClips and SentryClips entries enqueue (event-folder keys);
-        # RecentClips also enqueues (basename key). Total = 3 distinct
-        # canonical keys. (RecentClips and SavedClips share basename
-        # 2025-11-08_08-15-44-front.mp4 but DIFFERENT canonical_key
-        # because SavedClips is event-folder-keyed.)
+        result = boot_catchup_scan(db, '')
         assert result['scanned'] >= 3
         assert result['enqueued'] == 3
         with sqlite3.connect(db) as c:
@@ -2916,12 +3549,16 @@ class TestBootCatchupScan:
     def test_skips_already_indexed_clips(self, tmp_path):
         db = str(tmp_path / "g.db")
         _init_db(db)
-        tc = self._make_teslacam(tmp_path / "TeslaCam", [
+        self._make_archive(self._archive_root, [
             'RecentClips/2025-11-08_08-15-44-front.mp4',
         ])
-        # Pre-populate indexed_files with the same canonical_key.
+        # Pre-populate indexed_files with the canonical_key matching
+        # the ArchivedClips path. canonical_key for a RecentClips file
+        # is just the basename (so any pre-existing row with the same
+        # basename counts as "already indexed").
         full_path = os.path.join(
-            tc, 'RecentClips', '2025-11-08_08-15-44-front.mp4'
+            str(self._archive_root),
+            'RecentClips', '2025-11-08_08-15-44-front.mp4',
         )
         with sqlite3.connect(db) as c:
             c.execute(
@@ -2931,7 +3568,7 @@ class TestBootCatchupScan:
                    VALUES (?, 0, 0, '2025-01-01', 5, 0)""",
                 (full_path,),
             )
-        result = boot_catchup_scan(db, tc)
+        result = boot_catchup_scan(db, '')
         assert result['scanned'] >= 1
         assert result['already_indexed'] >= 1
         assert result['enqueued'] == 0
@@ -2939,16 +3576,17 @@ class TestBootCatchupScan:
     def test_skips_already_queued_clips(self, tmp_path):
         db = str(tmp_path / "g.db")
         _init_db(db)
-        tc = self._make_teslacam(tmp_path / "TeslaCam", [
+        self._make_archive(self._archive_root, [
             'RecentClips/2025-11-08_08-15-44-front.mp4',
         ])
         full_path = os.path.join(
-            tc, 'RecentClips', '2025-11-08_08-15-44-front.mp4'
+            str(self._archive_root),
+            'RecentClips', '2025-11-08_08-15-44-front.mp4',
         )
         # Pre-queue (e.g. from a watcher event during the scan).
         enqueue_for_indexing(db, full_path)
         # Catch-up must not double-enqueue.
-        result = boot_catchup_scan(db, tc)
+        result = boot_catchup_scan(db, '')
         assert result['enqueued'] == 0
         with sqlite3.connect(db) as c:
             count = c.execute(
@@ -2957,29 +3595,130 @@ class TestBootCatchupScan:
         assert count == 1
 
     def test_recent_and_archived_dedup_by_canonical_key(self, tmp_path):
-        # If a clip exists in both RecentClips and ArchivedClips, the
-        # catch-up should enqueue only once (canonical_key dedup).
+        # Two files with the same basename but DIFFERENT canonical_key
+        # (one flat under RecentClips, one nested under SavedClips/evt)
+        # should both enqueue — they're distinct canonical keys.
         db = str(tmp_path / "g.db")
         _init_db(db)
-        # ArchivedClips lives outside TeslaCam but _find_front_camera_videos
-        # picks it up via config.ARCHIVE_DIR. Without setting that env
-        # we just test the in-memory dedup against duplicate yields.
-        tc = self._make_teslacam(tmp_path / "TeslaCam", [
+        self._make_archive(self._archive_root, [
             'RecentClips/dup-front.mp4',
+            'SavedClips/evt/dup-front.mp4',
         ])
-        # Fake a second yield by also placing the file in a SavedClips
-        # event folder under the same basename — this WILL get a
-        # different canonical_key (event/saved keys are unique). So
-        # this verifies *that's* the case (no false dedup).
-        os.makedirs(os.path.join(tc, 'SavedClips', 'evt'), exist_ok=True)
-        with open(
-            os.path.join(tc, 'SavedClips', 'evt', 'dup-front.mp4'), 'wb'
-        ) as f:
-            f.write(b'')
-        result = boot_catchup_scan(db, tc)
+        result = boot_catchup_scan(db, '')
         # Two distinct canonical keys: bare 'dup-front.mp4' (Recent)
         # and 'SavedClips/evt/dup-front.mp4' (Saved).
         assert result['enqueued'] == 2
+
+    def test_legacy_teslacam_argument_is_ignored(self, tmp_path):
+        """Phase 2b: even if the caller passes a TeslaCam path with
+        clips on it, the scanner walks ArchivedClips ONLY. This is the
+        whole point of the redesign — the indexer must never touch
+        the RO USB mount."""
+        db = str(tmp_path / "g.db")
+        _init_db(db)
+        # Populate a legacy TeslaCam tree with clips that should NOT
+        # be enqueued.
+        legacy_tc = self._make_teslacam(tmp_path / "TeslaCam", [
+            'RecentClips/should-not-enqueue-front.mp4',
+            'SavedClips/evt/should-not-enqueue-front.mp4',
+        ])
+        # ArchivedClips is empty — scanner must report zero.
+        result = boot_catchup_scan(db, legacy_tc)
+        assert result == {
+            'scanned': 0, 'already_indexed': 0, 'enqueued': 0,
+            'skipped_by_watermark': 0,
+        }
+        with sqlite3.connect(db) as c:
+            count = c.execute(
+                "SELECT COUNT(*) FROM indexing_queue"
+            ).fetchone()[0]
+        assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #184 Wave 2 — Phase E: boot catch-up watermark
+# ---------------------------------------------------------------------------
+
+
+class TestBootCatchupWatermark:
+    """The boot catch-up scan persists a high-water mark of the highest
+    file mtime it has ever seen and uses it on subsequent boots to
+    skip files older than the watermark — turning the steady-state
+    boot scan from O(N) into O(new files)."""
+
+    def _make_archive(self, root, files):
+        for rel in files:
+            full = root / rel
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_bytes(b'')
+        return str(root)
+
+    @pytest.fixture(autouse=True)
+    def _patch_archive_dir(self, tmp_path, monkeypatch):
+        archive_root = tmp_path / "ArchivedClips"
+        archive_root.mkdir()
+        import config as _cfg
+        monkeypatch.setattr(_cfg, 'ARCHIVE_DIR', str(archive_root))
+        monkeypatch.setattr(_cfg, 'ARCHIVE_ENABLED', True)
+        self._archive_root = archive_root
+
+    def test_first_run_writes_watermark(self, tmp_path):
+        from services.mapping_service import (
+            _kv_get, _BOOT_CATCHUP_WATERMARK_KEY,
+        )
+        db = str(tmp_path / "g.db")
+        _init_db(db)
+        self._make_archive(self._archive_root, [
+            "RecentClips/2026-05-11_09-00-00-front.mp4",
+        ])
+        result = boot_catchup_scan(db, '')
+        assert result['scanned'] == 1
+        assert result['enqueued'] == 1
+        assert result['skipped_by_watermark'] == 0
+        # Watermark must be set to the file's mtime.
+        with sqlite3.connect(db) as conn:
+            stored = _kv_get(conn, _BOOT_CATCHUP_WATERMARK_KEY)
+        assert stored is not None
+        assert float(stored) > 0.0
+
+    def test_second_run_skips_unchanged_files(self, tmp_path):
+        db = str(tmp_path / "g.db")
+        _init_db(db)
+        self._make_archive(self._archive_root, [
+            "RecentClips/2026-05-11_09-00-00-front.mp4",
+            "RecentClips/2026-05-11_09-01-00-front.mp4",
+        ])
+        # First run — full scan.
+        first = boot_catchup_scan(db, '')
+        assert first['scanned'] == 2
+        # Second run — watermark covers both files.
+        second = boot_catchup_scan(db, '')
+        assert second['scanned'] == 2
+        assert second['skipped_by_watermark'] == 2
+        assert second['enqueued'] == 0
+        assert second['already_indexed'] == 0
+
+    def test_new_file_after_watermark_is_processed(self, tmp_path):
+        db = str(tmp_path / "g.db")
+        _init_db(db)
+        self._make_archive(self._archive_root, [
+            "RecentClips/2026-05-11_09-00-00-front.mp4",
+        ])
+        boot_catchup_scan(db, '')
+        # Add a new file with a strictly newer mtime.
+        new_path = (
+            self._archive_root / "RecentClips" /
+            "2026-05-11_09-05-00-front.mp4"
+        )
+        new_path.write_bytes(b'')
+        # Bump its mtime explicitly so the test isn't sensitive to
+        # filesystem timestamp granularity (FAT32 has 2-s resolution).
+        future = time.time() + 60
+        os.utime(str(new_path), (future, future))
+        result = boot_catchup_scan(db, '')
+        assert result['scanned'] == 2
+        assert result['skipped_by_watermark'] == 1
+        assert result['enqueued'] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -3179,6 +3918,45 @@ class TestStaleScanTrigger:
         )
         assert result is None
 
+    def test_blocking_helper_purges_orphaned_dead_letters(self, tmp_path):
+        """Issue #110 — _run_stale_scan_blocking also removes
+        ``indexing_queue`` dead-letter rows whose source file no
+        longer exists (typically because retention deleted a
+        truncated archive copy)."""
+        from services.indexing_queue_service import (
+            _PARSE_ERROR_MAX_ATTEMPTS,
+            enqueue_for_indexing,
+            get_queue_status,
+        )
+
+        db = str(tmp_path / "g.db")
+        _init_db(db)
+        tc = tmp_path / "TeslaCam"
+        tc.mkdir()
+
+        # Create a "front" clip, enqueue it for indexing, force it
+        # to dead-letter, then delete the file (simulating retention).
+        clip = tmp_path / "2026-05-11_08-41-58-front.mp4"
+        clip.write_bytes(b"fake")
+        assert enqueue_for_indexing(db, str(clip)) is True
+        with sqlite3.connect(db) as c:
+            c.execute(
+                "UPDATE indexing_queue SET attempts = ?, "
+                "last_error = 'No mdat box found' "
+                "WHERE file_path = ?",
+                (_PARSE_ERROR_MAX_ATTEMPTS, str(clip)),
+            )
+            c.commit()
+        assert get_queue_status(db)['dead_letter_count'] == 1
+        clip.unlink()
+
+        result = _run_stale_scan_blocking(db, str(tc), source='test')
+        assert result is not None
+        assert result.get('purged_dead_letters') == 1
+
+        # Row should be gone after the sweep.
+        assert get_queue_status(db)['dead_letter_count'] == 0
+
 
 
 class TestGapDetectionHelpers:
@@ -3350,7 +4128,7 @@ class TestGapAfterStamping:
         # per-segment RDP path preserves the gap_after flag on the
         # last simplified waypoint of the pre-gap segment so the
         # frontend renders TWO polylines per trip, not one.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-04-26T09:00:00', distance_km=3.0)
         # Build a longer drive on each side of the gap so RDP keeps
@@ -3394,7 +4172,7 @@ class TestGapAfterStamping:
         # Clean drive: no gap_after key should appear anywhere. Pin
         # the no-flag invariant so the payload doesn't grow for the
         # 99% case of well-indexed trips.
-        from services.mapping_service import query_all_routes_simplified
+        from services.mapping_queries import query_all_routes_simplified
         db_path, conn = self._make_db(tmp_path)
         self._add_trip(conn, 1, '2026-05-04T08:00:00', distance_km=3.0)
         for i in range(20):

@@ -62,7 +62,7 @@ TeslaUSB creates a multi-drive USB gadget that appears as **two or three separat
 - **Disambiguation popup**: Tapping the map at a location with multiple overlapping clips (e.g., a road driven multiple times) opens a chooser listing each clip with its trip date/time so the right one can be selected.
 - **Telemetry HUD**: Glassmorphic overlay showing real-time steering wheel angle, brake/gas pedal positions, speed, gear (P/R/N/D), turn signals, and Autopilot status — powered by pre-indexed server-side waypoint data (instant, no full video download needed)
 - **Auto-indexing**: A single low-priority background worker drains a SQLite-backed `indexing_queue` one file at a time. Producers: boot catch-up scan, real-time inotify on new files, the post-WiFi archive run, and manual reindex from the UI. The "Indexing…" banner only appears while a specific file is actively being parsed. Sentry events placed on map using inferred location from nearest trip
-- **RecentClips Archive**: Automatically copies RecentClips to the Pi's SD card every 5 minutes before Tesla's 1-hour circular buffer deletes them — zero USB disruption, videos preserved for 30 days
+- **RecentClips Archive**: Automatically copies RecentClips to the Pi's SD card every 2 minutes before Tesla's 1-hour circular buffer deletes them — zero USB disruption, videos preserved for 30 days
 - **Skeuomorphic event markers**: Balloon-pin map markers — brake pedal, gas pedal, steering wheel, speedometer, eye (sentry) — always visible on the map
 - **Trip navigation**: Floating trip card with prev/next navigation; FSD overlay toggle
 - Download all camera views for an event as a zip file
@@ -122,11 +122,15 @@ TeslaUSB creates a multi-drive USB gadget that appears as **two or three separat
 - **WiFi Roaming**: Automatic switching between access points with the same SSID for optimal signal strength (mesh networks and WiFi extenders)
 
 ### Cloud Archive
-- **Queue-based continuous sync**: Automatically uploads dashcam events to cloud storage (Google Drive, S3, Dropbox, etc.) via rclone
-- **Priority ordering**: Events with Tesla event.json uploaded first, then geolocated trips, then remaining clips
+- **Queue-based continuous sync**: Automatically uploads dashcam events to cloud storage via rclone
+- **Wide provider support**: OAuth providers (Google Drive, OneDrive, Dropbox); S3-compatible (Amazon S3, Backblaze B2, Wasabi, MinIO); and **NAS / custom rclone** backends (SFTP, WebDAV, SMB/CIFS, FTP, Azure Blob, OpenStack Swift) — issue #165
+- **Configurable folder selection**: Toggle which TeslaCam subfolders to back up — `SentryClips` (Sentry-triggered events), `SavedClips` (manually saved clips), and `ArchivedClips` (the SD-card-resident snapshot of `RecentClips`). `RecentClips` itself is intentionally **not** offered as a sync target because Tesla rotates it on a 1-hour ring; the archive subsystem copies survivors to `ArchivedClips` before they age out, so syncing `ArchivedClips` is what actually preserves driving footage long-term
+- **User-configurable priority order**: The order of the folder list in Settings is the sync order — drag `SavedClips` above `SentryClips` (for example) and saved clips drain first
+- **Reset counters button**: Zero the dashboard "Events Synced" and "Transferred" totals without losing the dedup history — files already uploaded to the cloud are **never** re-uploaded after a reset. "Pending" and "Failed" counters reflect current queue state and are unaffected by the reset
+- **Priority ordering within a folder**: Events with Tesla event.json uploaded first, then geolocated trips, then remaining clips
 - **Power-loss safe**: Files marked as synced only after rclone confirms upload; partial uploads detected and re-queued on restart
 - **Low impact**: Runs with `nice`/`ionice` throttling, configurable bandwidth limits, one file at a time — web UI stays responsive
-- **Web UI**: Configure cloud provider, browse remote folders, monitor sync queue and history, trigger manual uploads, bandwidth testing
+- **Web UI**: Configure cloud provider, browse remote folders, monitor sync queue and history, trigger manual uploads, reset dashboard counters, bandwidth testing
 
 ## Requirements
 
@@ -243,8 +247,8 @@ The web interface abstracts the underlying modes behind user-friendly labels:
 
 **Switch modes** via the device status card on the Settings page ("Enable Network Sharing" / "Reconnect to Tesla" buttons) or command line:
 ```bash
-sudo ~/TeslaUSB/present_usb.sh  # Reconnect to Tesla
-sudo ~/TeslaUSB/edit_usb.sh     # Enable Network Sharing
+sudo ~/TeslaUSB/scripts/present_usb.sh  # Reconnect to Tesla
+sudo ~/TeslaUSB/scripts/edit_usb.sh     # Enable Network Sharing
 ```
 
 ### Network Access
@@ -396,7 +400,7 @@ web:
 # ============================================================================
 archive:
   enabled: true                      # Enable RecentClips archival to SD card
-  interval_minutes: 5                # How often to check for new clips
+  interval_minutes: 2                # How often to check for new clips
   retention_days: 30                 # Delete archived clips older than this
   min_free_space_gb: 10              # Stop archiving if SD card < this free
   max_size_gb: 50                    # Cap on total archive folder size
@@ -492,7 +496,7 @@ The hardware watchdog automatically reboots the Pi if the system becomes unrespo
 
 ```bash
 watchdog-device = /dev/watchdog
-watchdog-timeout = 60
+watchdog-timeout = 90
 max-load-1 = 24
 realtime = yes
 priority = 1
@@ -516,7 +520,7 @@ The following options should be **avoided** on Raspberry Pi Zero 2 W (512MB RAM)
 4. Fix `/etc/watchdog.conf` to use the simple configuration above
 5. Remove the mask from `cmdline.txt` and reboot
 
-**Watchdog timeout**: Set to 60 seconds to accommodate large disk images (400GB+) which take longer to configure at boot. Smaller images work fine with 15 seconds, but 60 seconds is safe for all configurations.
+**Watchdog timeout**: Set to 90 seconds to accommodate (a) large disk images (400GB+) which take longer to configure at boot and (b) transient SDIO bus contention on the Pi Zero 2 W during heavy archive catch-up. Smaller images work fine with 15 seconds, but 90 seconds is safe for all configurations and prevents spurious reboots when the watchdog daemon is briefly stalled by the shared SDIO controller (SD card + WiFi chip).
 
 ## Troubleshooting
 
