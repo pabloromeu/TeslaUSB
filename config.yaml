@@ -61,9 +61,9 @@ offline_ap:
   check_interval: 20 # Seconds between health checks
   disconnect_grace: 30 # Seconds offline before starting AP
   min_rssi: -70 # Minimum RSSI (dBm) to tear down AP
-  stable_seconds: 20 # Seconds of good link before stopping AP
-  ping_target: 8.8.8.8 # Ping target to confirm WAN reachability
-  retry_seconds: 300 # While AP is active, retry STA join every N seconds
+  stable_seconds: 20 # Not used by wifi-monitor (kept for reference)
+  ping_target: 8.8.8.8 # Primary ping target to confirm WAN reachability (gateway is tried as fallback)
+  retry_seconds: 300 # Not used by wifi-monitor — STA retry uses exponential backoff (2→4→8→16→30 min)
   virtual_interface: uap0 # Virtual AP interface name (concurrent mode always enabled)
   force_mode: auto # Persistent force mode: auto, force_on, force_off
 

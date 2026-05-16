@@ -150,6 +150,12 @@ ping_ok() {
     ping -c 1 -W "$PING_TIMEOUT" "$PING_TARGET" >/dev/null 2>&1
 }
 
+gateway_ping_ok() {
+    local gw
+    gw=$(ip route show default 2>/dev/null | awk '/default via/ {print $3; exit}')
+    [ -n "$gw" ] && ping -c 1 -W 3 "$gw" >/dev/null 2>&1
+}
+
 check_wifi() {
     if ! link_up; then
         log "$WIFI_IF not associated"
@@ -162,7 +168,13 @@ check_wifi() {
     if ping_ok; then
         return 0
     fi
-    log "Ping to $PING_TARGET failed"
+    # Internet ping failed — try the local gateway before declaring disconnected.
+    # Handles routers that block outbound ICMP to 8.8.8.8 but are otherwise healthy.
+    if gateway_ping_ok; then
+        log "Internet ping failed but gateway reachable — treating as connected"
+        return 0
+    fi
+    log "Ping to $PING_TARGET and gateway both failed"
     return 1
 }
 
@@ -482,7 +494,7 @@ while true; do
             RETRY_DEADLINE=$(($(date +%s) + 30))
             sta_ok=0
             while [ "$(date +%s)" -lt "$RETRY_DEADLINE" ]; do
-                if link_up && ip_ready && ping_ok; then
+                if check_wifi; then
                     sta_ok=1
                     break
                 fi
@@ -537,7 +549,11 @@ while true; do
             else
                 # Last resort: try explicit nmcli reconnect to configured connection
                 log "Standard recovery failed; trying explicit nmcli reconnect"
-                active_conn=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ':.*wireless' | head -1 | cut -d: -f1)
+                active_conn=$(nmcli -t -f NAME,TYPE,AUTOCONNECT-PRIORITY connection show 2>/dev/null \
+                    | grep ':.*wireless' \
+                    | sort -t: -k3 -rn \
+                    | head -1 \
+                    | cut -d: -f1)
                 if [ -n "$active_conn" ]; then
                     nmcli connection up "$active_conn" 2>/dev/null && sleep 5
                     if check_wifi; then
