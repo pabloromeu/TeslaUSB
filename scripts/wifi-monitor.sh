@@ -150,6 +150,12 @@ ping_ok() {
     ping -c 1 -W "$PING_TIMEOUT" "$PING_TARGET" >/dev/null 2>&1
 }
 
+gateway_ping_ok() {
+    local gw
+    gw=$(ip route show default 2>/dev/null | awk '/default via/ {print $3; exit}')
+    [ -n "$gw" ] && ping -c 1 -W 3 "$gw" >/dev/null 2>&1
+}
+
 check_wifi() {
     if ! link_up; then
         log "$WIFI_IF not associated"
@@ -162,7 +168,13 @@ check_wifi() {
     if ping_ok; then
         return 0
     fi
-    log "Ping to $PING_TARGET failed"
+    # Internet ping failed — try the local gateway before declaring disconnected.
+    # Handles routers that block outbound ICMP to 8.8.8.8 but are otherwise healthy.
+    if gateway_ping_ok; then
+        log "Internet ping failed but gateway reachable — treating as connected"
+        return 0
+    fi
+    log "Ping to $PING_TARGET and gateway both failed"
     return 1
 }
 
@@ -431,19 +443,42 @@ while true; do
             if [ -n "$rssi" ] && [ "$rssi" -ge "$MIN_RSSI" ]; then
                 log "Auto mode: WiFi healthy (RSSI ${rssi}dBm); stopping AP"
                 stop_ap
+                # Reset the STA-retry backoff so the next outage gets
+                # quick retries again (Phase 1 item 1.1).
+                STA_RETRY_BACKOFF_CYCLES=6
+                STA_RETRY_FAILURES=0
                 sleep_interval
                 continue
             fi
         fi
 
         # WiFi still down while AP is active.
-        # Periodically stop AP and attempt STA reconnect (~every 2 min).
-        # Pi Zero 2 W single-radio can't scan/associate while AP holds the channel.
+        # Periodic STA reconnect attempt with EXPONENTIAL BACKOFF.
+        # Pi Zero 2 W single-radio can't scan/associate while AP holds
+        # the channel, so each retry stops the AP via
+        # brcmf_cfg80211_stop_ap — a heavy SDIO write that blocks the
+        # SDIO controller. Pre-fix forensics from May 11 (issue #95):
+        # 7 unclean shutdowns in 3 days, each preceded by 7
+        # ``brcmf_cfg80211_stop_ap failed -52`` lines in 16 minutes —
+        # the SDIO bus deadlocked long enough to miss the 90s
+        # /dev/watchdog ping → hardware reset.
+        #
+        # Backoff schedule (cycles between retries; ~20s per cycle
+        # while disconnected, see sleep_interval):
+        #   6 cycles ≈ 2 min   (initial)
+        #  12 cycles ≈ 4 min   (after 1st fail)
+        #  24 cycles ≈ 8 min   (after 2nd)
+        #  48 cycles ≈ 16 min  (after 3rd)
+        #  90 cycles ≈ 30 min  (cap — after 4+)
+        # Reset to 6 on STA success (driving home from a long trip
+        # detects the WiFi within ~2 min of arrival).
         STA_RETRY_COUNTER=${STA_RETRY_COUNTER:-0}
+        STA_RETRY_BACKOFF_CYCLES=${STA_RETRY_BACKOFF_CYCLES:-6}
+        STA_RETRY_FAILURES=${STA_RETRY_FAILURES:-0}
         STA_RETRY_COUNTER=$((STA_RETRY_COUNTER + 1))
-        if [ $STA_RETRY_COUNTER -ge 6 ]; then
+        if [ $STA_RETRY_COUNTER -ge $STA_RETRY_BACKOFF_CYCLES ]; then
             STA_RETRY_COUNTER=0
-            log "Periodic STA retry: stopping AP to attempt home WiFi"
+            log "Periodic STA retry (backoff=${STA_RETRY_BACKOFF_CYCLES} cycles, prior failures=${STA_RETRY_FAILURES}): stopping AP to attempt home WiFi"
             stop_ap
             sleep 5
 
@@ -459,7 +494,7 @@ while true; do
             RETRY_DEADLINE=$(($(date +%s) + 30))
             sta_ok=0
             while [ "$(date +%s)" -lt "$RETRY_DEADLINE" ]; do
-                if link_up && ip_ready && ping_ok; then
+                if check_wifi; then
                     sta_ok=1
                     break
                 fi
@@ -470,8 +505,19 @@ while true; do
                 log "STA reconnected — AP stays off"
                 FAILURE_COUNT=0
                 LAST_GOOD_TS=$(date +%s)
+                # Reset backoff to its minimum so the NEXT outage
+                # gets quick retries again.
+                STA_RETRY_BACKOFF_CYCLES=6
+                STA_RETRY_FAILURES=0
             else
-                log "STA retry failed after 30s — restarting AP"
+                STA_RETRY_FAILURES=$((STA_RETRY_FAILURES + 1))
+                # Double the backoff (cap 90 cycles ≈ 30 min). bash's
+                # built-in arithmetic is fine for this small range.
+                STA_RETRY_BACKOFF_CYCLES=$((STA_RETRY_BACKOFF_CYCLES * 2))
+                if [ $STA_RETRY_BACKOFF_CYCLES -gt 90 ]; then
+                    STA_RETRY_BACKOFF_CYCLES=90
+                fi
+                log "STA retry failed after 30s (consec failures=${STA_RETRY_FAILURES}, next retry in ~${STA_RETRY_BACKOFF_CYCLES} cycles) — restarting AP"
                 start_ap || log "AP restart failed"
             fi
         fi
@@ -503,7 +549,11 @@ while true; do
             else
                 # Last resort: try explicit nmcli reconnect to configured connection
                 log "Standard recovery failed; trying explicit nmcli reconnect"
-                active_conn=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ':.*wireless' | head -1 | cut -d: -f1)
+                active_conn=$(nmcli -t -f NAME,TYPE,AUTOCONNECT-PRIORITY connection show 2>/dev/null \
+                    | grep ':.*wireless' \
+                    | sort -t: -k3 -rn \
+                    | head -1 \
+                    | cut -d: -f1)
                 if [ -n "$active_conn" ]; then
                     nmcli connection up "$active_conn" 2>/dev/null && sleep 5
                     if check_wifi; then
