@@ -346,6 +346,12 @@ start_ap() {
 
     record_ap_start
     log "Fallback AP started on $iface (SSID: $AP_SSID)"
+
+    # Restart avahi-daemon so it discovers the newly-created uap0 interface
+    # and answers mDNS queries (*.local) from phones on the AP network.
+    # Without this, iOS/Android use multicast mDNS and never ask dnsmasq,
+    # so teslausb.local fails to resolve even though dnsmasq is configured.
+    systemctl restart avahi-daemon 2>/dev/null || log "avahi-daemon restart failed (non-fatal)"
 }
 
 # Removed: maybe_retry_sta_from_ap() - no longer needed with mandatory concurrent mode

@@ -28,6 +28,18 @@ def get_ap_ssid():
         pass
     return 'TeslaUSB'
 
+def get_ap_gateway():
+    """Get the AP gateway IP from config.yaml (the part before the /prefix)."""
+    try:
+        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config.yaml')
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+            cidr = config.get('offline_ap', {}).get('ipv4_cidr', '192.168.4.1/24')
+            return cidr.split('/')[0]
+    except Exception:
+        pass
+    return '192.168.4.1'
+
 # List of common captive portal detection endpoints
 # These are URLs that various operating systems check to detect captive portals
 CAPTIVE_PORTAL_ENDPOINTS = [
@@ -60,7 +72,7 @@ def apple_captive_portal():
     Show a branded splash screen instead of auto-redirecting.
     """
     logger.info(f"Apple captive portal detection from {request.remote_addr}")
-    return render_template('captive_portal.html', ssid=get_ap_ssid())
+    return render_template('captive_portal.html', ssid=get_ap_ssid(), gateway=get_ap_gateway())
 
 @captive_portal_bp.route('/generate_204')
 @captive_portal_bp.route('/gen_204')
@@ -71,7 +83,7 @@ def android_captive_portal():
     Show the branded splash screen.
     """
     logger.info(f"Android captive portal detection from {request.remote_addr}")
-    return render_template('captive_portal.html', ssid=get_ap_ssid())
+    return render_template('captive_portal.html', ssid=get_ap_ssid(), gateway=get_ap_gateway())
 
 @captive_portal_bp.route('/connecttest.txt')
 @captive_portal_bp.route('/ncsi.txt')
@@ -82,7 +94,7 @@ def windows_captive_portal():
     Show the branded splash screen.
     """
     logger.info(f"Windows captive portal detection from {request.remote_addr}")
-    return render_template('captive_portal.html', ssid=get_ap_ssid())
+    return render_template('captive_portal.html', ssid=get_ap_ssid(), gateway=get_ap_gateway())
 
 @captive_portal_bp.route('/success.txt')
 @captive_portal_bp.route('/canonical.html')
@@ -92,7 +104,7 @@ def generic_captive_portal():
     Show the branded splash screen.
     """
     logger.info(f"Generic captive portal detection from {request.remote_addr}")
-    return render_template('captive_portal.html', ssid=get_ap_ssid())
+    return render_template('captive_portal.html', ssid=get_ap_ssid(), gateway=get_ap_gateway())
 
 @captive_portal_bp.route('/favicon.ico')
 def favicon():
